@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 #  CONFIGURATION — edit these values
 # ============================================================
 
-BOT_TOKEN = "MTQ5OTAxNDEyMjQwOTU1ODAzNg.GmMaLA.xmXqYfXBOxTwl2DNUoVvYEj5nvdBUo3-SGLM3U"
+BOT_TOKEN = "MTQ5OTAxNDEyMjQwOTU1ODAzNg.GTsKBR.5ZebV5F-ak5KQvQLnMixUWsZnMSjnCW32MpY8c"
 
 ACTIVE_ROLE_NAME = "Active"          # Must match your role name exactly
 ACTIVE_DURATION_DAYS = 30            # Days before role is removed

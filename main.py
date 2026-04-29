@@ -1,4 +1,4 @@
-import discord
+import os
 import asyncio
 from datetime import datetime, timedelta, timezone
 
@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 #  CONFIGURATION — edit these values
 # ============================================================
 
-BOT_TOKEN = "PASTE_YOUR_BOT_TOKEN_HERE"
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 
 ACTIVE_ROLE_NAME = "Active"          # Must match your role name exactly
 ACTIVE_DURATION_DAYS = 30            # Days before role is removed

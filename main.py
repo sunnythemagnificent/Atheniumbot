@@ -129,60 +129,49 @@ async def check_expirations():
 async def send_reminders():
     await client.wait_until_ready()
 
-    # Tracks when the bot last successfully posted in each channel
-    # Format: { channel_id: datetime }
-    last_posted = {}
-
     while not client.is_closed():
         now = datetime.now(timezone.utc)
-        next_check = REMINDER_INTERVAL_HOURS * 3600  # default 24h until next check
+        next_sleep = REMINDER_INTERVAL_HOURS * 3600  # default 24h
 
         for guild in client.guilds:
             for channel in guild.text_channels:
                 if channel.name in REMINDER_CHANNELS:
                     try:
-                        # Check the last message in the channel
-                        last_message = [msg async for msg in channel.history(limit=1)]
-                        bot_was_last = last_message and last_message[0].author == client.user
+                        # Find the bot's last message in this channel
+                        bot_last_post = None
+                        async for msg in channel.history(limit=50):
+                            if msg.author == client.user:
+                                bot_last_post = msg.created_at
+                                break
 
-                        if bot_was_last:
-                            # Work out how long ago the bot posted
-                            bot_post_time = last_message[0].created_at
-                            time_since = (now - bot_post_time).total_seconds()
-                            time_until_next = (REMINDER_INTERVAL_HOURS * 3600) - time_since
+                        if bot_last_post:
+                            time_since_post = (now - bot_last_post).total_seconds()
+                            time_until_next = (REMINDER_INTERVAL_HOURS * 3600) - time_since_post
 
                             if time_until_next > 0:
-                                # Still within the 24h window — skip and schedule retry
-                                hours_left = round(time_until_next / 3600, 1)
-                                print(f"⏭️ Skipping #{channel.name} — {hours_left}h left on schedule")
-                                next_check = min(next_check, REMINDER_RETRY_HOURS * 3600)
-                            else:
-                                # 24h has passed since bot last posted but no one else did
-                                await channel.send(REMINDER_MESSAGE)
-                                last_posted[channel.id] = now
-                                print(f"📢 Sent reminder to #{channel.name} (24h elapsed, still no new posts)")
-                        else:
-                            # Someone posted since last reminder — check if 24h has passed
-                            last = last_posted.get(channel.id)
-                            if last:
-                                time_since_last = (now - last).total_seconds()
-                                time_until_next = (REMINDER_INTERVAL_HOURS * 3600) - time_since_last
-                                if time_until_next > 0:
+                                # Not yet time — check if someone posted after the bot
+                                last_message = [msg async for msg in channel.history(limit=1)]
+                                if last_message and last_message[0].author == client.user:
+                                    # Bot still last — retry in 2h
                                     hours_left = round(time_until_next / 3600, 1)
-                                    print(f"⏳ #{channel.name} has new posts but {hours_left}h left on schedule")
-                                    next_check = min(next_check, time_until_next)
-                                    continue
+                                    print(f"⏭️ #{channel.name} — bot was last, {hours_left}h left, retry in {REMINDER_RETRY_HOURS}h")
+                                    next_sleep = min(next_sleep, REMINDER_RETRY_HOURS * 3600)
+                                else:
+                                    # Someone posted after bot — wait remaining time
+                                    hours_left = round(time_until_next / 3600, 1)
+                                    print(f"⏳ #{channel.name} — new posts, {hours_left}h left on schedule")
+                                    next_sleep = min(next_sleep, time_until_next)
+                                continue
 
-                            # Either never posted or 24h has passed — send reminder
-                            await channel.send(REMINDER_MESSAGE)
-                            last_posted[channel.id] = now
-                            print(f"📢 Sent reminder to #{channel.name}")
+                        # Either never posted or 24h has passed — send reminder
+                        await channel.send(REMINDER_MESSAGE)
+                        print(f"📢 Sent reminder to #{channel.name}")
 
                     except Exception as e:
                         print(f"⚠️ Could not send to #{channel.name}: {e}")
 
-        print(f"⏰ Next check in {round(next_check / 3600, 1)} hours")
-        await asyncio.sleep(next_check)
+        print(f"⏰ Next check in {round(next_sleep / 3600, 1)} hours")
+        await asyncio.sleep(next_sleep)
 
 
 # ============================================================

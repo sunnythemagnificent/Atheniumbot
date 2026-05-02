@@ -22,6 +22,24 @@ IGNORED_CHANNELS = [
     "💍︱mudae",
 ]
 
+# Channels to post the reminder in (no # symbol needed)
+REMINDER_CHANNELS = [
+    "🎨︱art",
+    "🎨︱art2",
+    "🏠︱character-clubhouse",
+    "📝︱writing",
+]
+
+REMINDER_INTERVAL_HOURS = 2
+
+REMINDER_MESSAGE = """Friendly reminder from us here at Athenaeum to respect others posting of their work! Try to make sure you are:
+
+• Compliment/comment on those who have posted above you if it's been within the past 30 minutes.
+• Try not to steal the spotlight from others who may be scared to share.
+• Make sure you're giving more than you take from the guild and group.
+
+We want everyone to be comfortable and feel encouraged here! Thanks for helping us make this community great!"""
+
 # ============================================================
 #  BOT SETUP
 # ============================================================
@@ -46,6 +64,7 @@ async def on_ready():
     print(f"✅ Logged in as {client.user}")
     print(f"📋 Watching for activity | Role: '{ACTIVE_ROLE_NAME}' | Window: {ACTIVE_DURATION_DAYS} days")
     client.loop.create_task(check_expirations())
+    client.loop.create_task(send_reminders())
 
 
 @client.event
@@ -100,6 +119,24 @@ async def check_expirations():
                         print(f"⏰ Removed '{ACTIVE_ROLE_NAME}' from {member.display_name} (inactive 30 days)")
 
         await asyncio.sleep(3600)  # Check every hour
+
+
+# ============================================================
+#  BACKGROUND TASK — posts reminder message every 2 hours
+# ============================================================
+
+async def send_reminders():
+    await client.wait_until_ready()
+    while not client.is_closed():
+        for guild in client.guilds:
+            for channel in guild.text_channels:
+                if channel.name in REMINDER_CHANNELS:
+                    try:
+                        await channel.send(REMINDER_MESSAGE)
+                        print(f"📢 Sent reminder to #{channel.name}")
+                    except Exception as e:
+                        print(f"⚠️ Could not send to #{channel.name}: {e}")
+        await asyncio.sleep(REMINDER_INTERVAL_HOURS * 3600)
 
 
 # ============================================================

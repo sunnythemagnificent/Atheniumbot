@@ -30,11 +30,12 @@ REMINDER_CHANNELS = [
     "📝︱writing",
 ]
 
-REMINDER_INTERVAL_HOURS = 2
+REMINDER_INTERVAL_HOURS = 24
+REMINDER_RETRY_HOURS = 2
 
-REMINDER_MESSAGE = """Friendly reminder from us here at Athenaeum to respect others posting of their work! Try to make sure you are:
+REMINDER_MESSAGE = """Friendly reminder from us here at Athenaeum to respect others posting of their work! *Try* to make sure you are:
 
-• Compliment/comment on those who have posted above you if it's been within the past 30 minutes.
+• Compliment/comment on those who have posted above you.
 • Try not to steal the spotlight from others who may be scared to share.
 • Make sure you're giving more than you take from the guild and group.
 
@@ -128,15 +129,31 @@ async def check_expirations():
 async def send_reminders():
     await client.wait_until_ready()
     while not client.is_closed():
+        any_skipped = False
         for guild in client.guilds:
             for channel in guild.text_channels:
                 if channel.name in REMINDER_CHANNELS:
                     try:
-                        await channel.send(REMINDER_MESSAGE)
-                        print(f"📢 Sent reminder to #{channel.name}")
+                        # Check the last message in the channel
+                        last_message = [msg async for msg in channel.history(limit=1)]
+                        if last_message and last_message[0].author == client.user:
+                            # Bot was last to post — skip this channel
+                            print(f"⏭️ Skipping #{channel.name} — bot was last to post")
+                            any_skipped = True
+                        else:
+                            await channel.send(REMINDER_MESSAGE)
+                            print(f"📢 Sent reminder to #{channel.name}")
                     except Exception as e:
                         print(f"⚠️ Could not send to #{channel.name}: {e}")
-        await asyncio.sleep(REMINDER_INTERVAL_HOURS * 3600)
+
+        if any_skipped:
+            # At least one channel was skipped — retry in 2 hours
+            print(f"⏰ Some channels skipped, retrying in {REMINDER_RETRY_HOURS} hours")
+            await asyncio.sleep(REMINDER_RETRY_HOURS * 3600)
+        else:
+            # All channels posted — back to normal 24h schedule
+            print(f"✅ All reminders sent, next check in {REMINDER_INTERVAL_HOURS} hours")
+            await asyncio.sleep(REMINDER_INTERVAL_HOURS * 3600)
 
 
 # ============================================================

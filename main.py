@@ -33,9 +33,14 @@ REMINDER_CHANNELS = [
 REMINDER_INTERVAL_HOURS = 24
 REMINDER_RETRY_HOURS = 2
 
+# Giveaway channel settings
+GIVEAWAY_CHANNEL = "🎁︱giveaways"          # Channel name without #
+GIVEAWAY_BOT_ROLE = "GiveawayBot"          # Role name of the giveaway bot — must match exactly
+GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
+
 REMINDER_MESSAGE = """Friendly reminder from us here at Athenaeum to respect others posting of their work! Try to make sure you are:
 
-• Compliment/comment on those who have posted above you if it's been within the past 30 minutes.
+• Compliment/comment on those who have posted above you.
 • Try not to steal the spotlight from others who may be scared to share.
 • Make sure you're giving more than you take from the guild and group.
 
@@ -70,16 +75,39 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # Ignore messages from bots
+    # Ignore messages from bots UNLESS it's in the giveaway channel
+    # (we still need to process giveaway channel messages from real users)
     if message.author.bot:
-        return
-
-    # Ignore configured channels
-    if message.channel.name in IGNORED_CHANNELS:
         return
 
     guild = message.guild
     if guild is None:
+        return
+
+    # --------------------------------------------------------
+    #  GIVEAWAY CHANNEL — silently delete non-giveaway messages
+    # --------------------------------------------------------
+    if message.channel.name == GIVEAWAY_CHANNEL:
+        # Check if the author has the GiveawayBot role
+        author_roles = [r.name for r in message.author.roles]
+        if GIVEAWAY_BOT_ROLE in author_roles:
+            # It's the giveaway bot — leave it alone
+            return
+
+        # Regular member message — wait 10 minutes then silently delete
+        async def delayed_delete(msg):
+            await asyncio.sleep(GIVEAWAY_DELETE_SECONDS)
+            try:
+                await msg.delete()
+                print(f"🗑️ Silently deleted message from {msg.author.display_name} in #{msg.channel.name}")
+            except Exception as e:
+                print(f"⚠️ Could not delete message: {e}")
+
+        asyncio.ensure_future(delayed_delete(message))
+        return
+
+    # Ignore configured channels for activity tracking
+    if message.channel.name in IGNORED_CHANNELS:
         return
 
     member = message.author
@@ -123,7 +151,7 @@ async def check_expirations():
 
 
 # ============================================================
-#  BACKGROUND TASK — posts reminder message every 2 hours
+#  BACKGROUND TASK — posts reminder message every 24 hours
 # ============================================================
 
 async def send_reminders():

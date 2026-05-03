@@ -40,7 +40,7 @@ GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
 
 REMINDER_MESSAGE = """Friendly reminder from us here at Athenaeum to respect others posting of their work! Try to make sure you are:
 
-• Compliment/comment on those who have posted above you.
+• Compliment/comment on those who have posted above you if it's been within the past 30 minutes.
 • Try not to steal the spotlight from others who may be scared to share.
 • Make sure you're giving more than you take from the guild and group.
 
@@ -151,7 +151,7 @@ async def check_expirations():
 
 
 # ============================================================
-#  BACKGROUND TASK — posts reminder message every 24 hours
+#  BACKGROUND TASK — posts reminder message every 2 hours
 # ============================================================
 
 async def send_reminders():
@@ -167,7 +167,7 @@ async def send_reminders():
                     try:
                         # Find the bot's last message in this channel
                         bot_last_post = None
-                        async for msg in channel.history(limit=50):
+                        async for msg in channel.history(limit=500):
                             if msg.author == client.user:
                                 bot_last_post = msg.created_at
                                 break

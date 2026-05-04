@@ -40,7 +40,7 @@ GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
 
 REMINDER_MESSAGE = """Friendly reminder from us here at Athenaeum to respect others posting of their work! Try to make sure you are:
 
-• Compliment/comment on those who have posted above you if it's been within the past 30 minutes.
+• Compliment/comment on those who have posted above you.
 • Try not to steal the spotlight from others who may be scared to share.
 • Make sure you're giving more than you take from the guild and group.
 

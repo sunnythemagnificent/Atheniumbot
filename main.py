@@ -26,6 +26,7 @@ IGNORED_CHANNELS = [
 GIVEAWAY_CHANNEL = "🎁︱giveaways"          # Channel name without #
 GIVEAWAY_BOT_ROLE = "GiveawayBot"          # Role name of the giveaway bot — must match exactly
 GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
+GIVEAWAY_PING_ROLE = "giveaways"           # Role to ping when a new giveaway is detected
 
 # ============================================================
 #  BOT SETUP
@@ -55,26 +56,38 @@ async def on_ready():
 
 @client.event
 async def on_message(message):
-    # Ignore messages from bots UNLESS it's in the giveaway channel
-    # (we still need to process giveaway channel messages from real users)
-    if message.author.bot:
-        return
-
-    guild = message.guild
-    if guild is None:
+    if message.guild is None:
         return
 
     # --------------------------------------------------------
-    #  GIVEAWAY CHANNEL — silently delete non-giveaway messages
+    #  GIVEAWAY CHANNEL
     # --------------------------------------------------------
     if message.channel.name == GIVEAWAY_CHANNEL:
-        # Check if the author has the GiveawayBot role
-        author_roles = [r.name for r in message.author.roles]
-        if GIVEAWAY_BOT_ROLE in author_roles:
-            # It's the giveaway bot — leave it alone
+
+        # Check if it's the GiveawayBot posting
+        if message.author.bot:
+            author_role_names = [r.name for r in getattr(message.author, 'roles', [])]
+            if GIVEAWAY_BOT_ROLE in author_role_names:
+                # Check embeds for "Ends:" but not "Ended:" — means it's a fresh giveaway
+                embed_text = ""
+                for embed in message.embeds:
+                    if embed.description:
+                        embed_text += embed.description
+                    for field in embed.fields:
+                        embed_text += field.value
+
+                if "Ends:" in embed_text and "Ended:" not in embed_text:
+                    ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
+                    if ping_role:
+                        await message.channel.send(ping_role.mention)
+                        print(f"🎉 Pinged @{GIVEAWAY_PING_ROLE} for new giveaway in #{message.channel.name}")
             return
 
-        # Regular member message — wait 10 minutes then silently delete
+        # Never delete the bot's own messages
+        if message.author == client.user:
+            return
+
+        # Regular member message in giveaway channel — silently delete after 10 minutes
         async def delayed_delete(msg):
             await asyncio.sleep(GIVEAWAY_DELETE_SECONDS)
             try:
@@ -86,12 +99,19 @@ async def on_message(message):
         asyncio.ensure_future(delayed_delete(message))
         return
 
+    # Ignore all other bot messages
+    if message.author.bot:
+        return
+
     # Ignore configured channels for activity tracking
     if message.channel.name in IGNORED_CHANNELS:
         return
 
+    # --------------------------------------------------------
+    #  ACTIVE ROLE TRACKING
+    # --------------------------------------------------------
     member = message.author
-    role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
+    role = discord.utils.get(message.guild.roles, name=ACTIVE_ROLE_NAME)
 
     if role is None:
         print(f"⚠️  Role '{ACTIVE_ROLE_NAME}' not found. Check the name matches exactly.")

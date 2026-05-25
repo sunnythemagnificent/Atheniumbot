@@ -56,6 +56,7 @@ async def maybe_ping_giveaway(message):
     if not message.author.bot:
         return
     if message.id in pinged_giveaways:
+        print(f"⏭️ Already pinged for message {message.id}, skipping")
         return
 
     author_role_names = [r.name for r in getattr(message.author, 'roles', [])]
@@ -65,12 +66,16 @@ async def maybe_ping_giveaway(message):
     # Check embeds for "Ends:" but not "Ended:"
     embed_text = ""
     for embed in message.embeds:
+        if embed.title:
+            embed_text += embed.title + " "
         if embed.description:
-            embed_text += embed.description
+            embed_text += embed.description + " "
+        if embed.footer and embed.footer.text:
+            embed_text += embed.footer.text + " "
         for field in embed.fields:
-            embed_text += field.value
+            embed_text += field.name + " " + field.value + " "
 
-    print(f"🔍 GiveawayBot embed text: '{embed_text[:100]}'")
+    print(f"🔍 GiveawayBot embed text: '{embed_text[:200]}'")
 
     if "Ends:" in embed_text and "Ended:" not in embed_text:
         ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)

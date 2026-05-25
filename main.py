@@ -26,7 +26,7 @@ IGNORED_CHANNELS = [
 GIVEAWAY_CHANNEL = "🎁︱giveaways"          # Channel name without #
 GIVEAWAY_BOT_ROLE = "GiveawayBot"          # Role name of the giveaway bot — must match exactly
 GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
-GIVEAWAY_PING_ROLE = "giveaways"           # Role to ping when a new giveaway is detected
+GIVEAWAY_PING_ROLE = "Giveaways"           # Role to ping when a new giveaway is detected
 
 # ============================================================
 #  BOT SETUP
@@ -84,6 +84,7 @@ async def maybe_ping_giveaway(message):
     
     if "Ends:" in embed_text and "Ended:" not in embed_text:
         ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
+        print(f"🔍 Looking for role '{GIVEAWAY_PING_ROLE}' — found: {ping_role}")
         if ping_role:
             pinged_giveaways.add(message.id)
             await message.channel.send(ping_role.mention)

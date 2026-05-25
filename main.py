@@ -42,6 +42,43 @@ client = discord.Client(intents=intents)
 # Format: { user_id: datetime }
 expiry_times = {}
 
+# Track which giveaway messages we've already pinged for (avoid double pinging)
+pinged_giveaways = set()
+
+
+# ============================================================
+#  HELPER — check and ping for fresh giveaway
+# ============================================================
+
+async def maybe_ping_giveaway(message):
+    if message.channel.name != GIVEAWAY_CHANNEL:
+        return
+    if not message.author.bot:
+        return
+    if message.id in pinged_giveaways:
+        return
+
+    author_role_names = [r.name for r in getattr(message.author, 'roles', [])]
+    if GIVEAWAY_BOT_ROLE not in author_role_names:
+        return
+
+    # Check embeds for "Ends:" but not "Ended:"
+    embed_text = ""
+    for embed in message.embeds:
+        if embed.description:
+            embed_text += embed.description
+        for field in embed.fields:
+            embed_text += field.value
+
+    print(f"🔍 GiveawayBot embed text: '{embed_text[:100]}'")
+
+    if "Ends:" in embed_text and "Ended:" not in embed_text:
+        ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
+        if ping_role:
+            pinged_giveaways.add(message.id)
+            await message.channel.send(ping_role.mention)
+            print(f"🎉 Pinged @{GIVEAWAY_PING_ROLE} for new giveaway in #{message.channel.name}")
+
 
 # ============================================================
 #  EVENTS
@@ -64,30 +101,16 @@ async def on_message(message):
     # --------------------------------------------------------
     if message.channel.name == GIVEAWAY_CHANNEL:
 
-        # Check if it's the GiveawayBot posting
-        if message.author.bot:
-            author_role_names = [r.name for r in getattr(message.author, 'roles', [])]
-            if GIVEAWAY_BOT_ROLE in author_role_names:
-                # Check embeds for "Ends:" but not "Ended:" — means it's a fresh giveaway
-                embed_text = ""
-                for embed in message.embeds:
-                    if embed.description:
-                        embed_text += embed.description
-                    for field in embed.fields:
-                        embed_text += field.value
-
-                if "Ends:" in embed_text and "Ended:" not in embed_text:
-                    ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
-                    if ping_role:
-                        await message.channel.send(ping_role.mention)
-                        print(f"🎉 Pinged @{GIVEAWAY_PING_ROLE} for new giveaway in #{message.channel.name}")
-            return
-
-        # Never delete the bot's own messages
+        # Never touch the bot's own messages
         if message.author == client.user:
             return
 
-        # Regular member message in giveaway channel — silently delete after 10 minutes
+        if message.author.bot:
+            # Try to ping immediately (works if embed is already attached)
+            await maybe_ping_giveaway(message)
+            return
+
+        # Regular member message — silently delete after 10 minutes
         async def delayed_delete(msg):
             await asyncio.sleep(GIVEAWAY_DELETE_SECONDS)
             try:
@@ -117,14 +140,25 @@ async def on_message(message):
         print(f"⚠️  Role '{ACTIVE_ROLE_NAME}' not found. Check the name matches exactly.")
         return
 
-    # Set or refresh the expiry time
     expiry = datetime.now(timezone.utc) + timedelta(days=ACTIVE_DURATION_DAYS)
     expiry_times[member.id] = expiry
 
-    # Assign the role if they don't already have it
     if role not in member.roles:
         await member.add_roles(role)
         print(f"✅ Gave '{ACTIVE_ROLE_NAME}' to {member.display_name}")
+
+
+@client.event
+async def on_message_edit(before, after):
+    # GiveawayBot often edits its message to attach the embed
+    # This catches it the moment the embed appears
+    if after.guild is None:
+        return
+    if after.channel.name != GIVEAWAY_CHANNEL:
+        return
+    if not after.author.bot:
+        return
+    await maybe_ping_giveaway(after)
 
 
 # ============================================================

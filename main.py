@@ -78,6 +78,11 @@ async def maybe_ping_giveaway(message):
     print(f"🔍 GiveawayBot embed text: '{embed_text[:200]}'")
 
     if "Ends:" in embed_text and "Ended:" not in embed_text:
+        print(f"✅ Fresh giveaway detected!")
+    elif "Ends:" in embed_text and "Ended:" in embed_text:
+        print(f"⚠️ Both Ends: and Ended: found — treating as ended, skipping")
+    
+    if "Ends:" in embed_text and "Ended:" not in embed_text:
         ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
         if ping_role:
             pinged_giveaways.add(message.id)

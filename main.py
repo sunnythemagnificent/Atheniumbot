@@ -81,7 +81,7 @@ async def maybe_ping_giveaway(message):
         print(f"✅ Fresh giveaway detected!")
     elif "Ends:" in embed_text and "Ended:" in embed_text:
         print(f"⚠️ Both Ends: and Ended: found — treating as ended, skipping")
-    
+
     if "Ends:" in embed_text and "Ended:" not in embed_text:
         ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
         print(f"🔍 Looking for role '{GIVEAWAY_PING_ROLE}' — found: {ping_role}")
@@ -89,6 +89,65 @@ async def maybe_ping_giveaway(message):
             pinged_giveaways.add(message.id)
             await message.channel.send(ping_role.mention)
             print(f"🎉 Pinged @{GIVEAWAY_PING_ROLE} for new giveaway in #{message.channel.name}")
+
+
+# ============================================================
+#  STARTUP ACTIVITY CHECK
+# ============================================================
+
+async def startup_activity_check():
+    await client.wait_until_ready()
+    print(f"🔍 Running startup activity check...")
+
+    for guild in client.guilds:
+        active_role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
+        if not active_role:
+            print(f"⚠️ Role '{ACTIVE_ROLE_NAME}' not found in {guild.name}")
+            continue
+
+        # Get all channels we should check (excluding ignored ones)
+        valid_channels = [
+            c for c in guild.text_channels
+            if c.name not in IGNORED_CHANNELS
+            and c.name != GIVEAWAY_CHANNEL
+        ]
+
+        # Get all members with the Active role
+        active_members = [m for m in guild.members if active_role in m.roles]
+        print(f"📋 Checking {len(active_members)} members with Active role...")
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=ACTIVE_DURATION_DAYS)
+
+        for member in active_members:
+            if member.bot:
+                continue
+
+            # Check if they've posted in any valid channel in the last 30 days
+            last_post = None
+            for channel in valid_channels:
+                try:
+                    async for msg in channel.history(limit=500, after=cutoff):
+                        if msg.author.id == member.id:
+                            if last_post is None or msg.created_at > last_post:
+                                last_post = msg.created_at
+                            break
+                except Exception:
+                    continue
+
+            if last_post:
+                # They've been active — set their expiry from their last post
+                expiry = last_post + timedelta(days=ACTIVE_DURATION_DAYS)
+                expiry_times[member.id] = expiry
+                print(f"✅ {member.display_name} — last post {last_post.strftime('%Y-%m-%d')}, expires {expiry.strftime('%Y-%m-%d')}")
+            else:
+                # No post found in last 30 days — remove Active role
+                try:
+                    await member.remove_roles(active_role)
+                    print(f"⏰ Removed '{ACTIVE_ROLE_NAME}' from {member.display_name} (no posts in 30 days)")
+                except Exception as e:
+                    print(f"⚠️ Could not remove role from {member.display_name}: {e}")
+
+    print(f"✅ Startup activity check complete!")
 
 
 # ============================================================
@@ -100,6 +159,7 @@ async def on_ready():
     print(f"✅ Logged in as {client.user}")
     print(f"📋 Watching for activity | Role: '{ACTIVE_ROLE_NAME}' | Window: {ACTIVE_DURATION_DAYS} days")
     client.loop.create_task(check_expirations())
+    client.loop.create_task(startup_activity_check())
 
 
 @client.event

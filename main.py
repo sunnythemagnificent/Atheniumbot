@@ -1,6 +1,9 @@
 import discord
+from discord import app_commands
+from discord.ext import commands
 import asyncio
 import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
@@ -28,6 +31,122 @@ GIVEAWAY_BOT_ROLE = "GiveawayBot"          # Role name of the giveaway bot — m
 GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
 GIVEAWAY_PING_ROLE = "Giveaways"           # Role to ping when a new giveaway is detected
 
+# Where the persistent database lives — this should point inside your Railway Volume
+DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
+
+# ============================================================
+#  DATABASE SETUP
+# ============================================================
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    # Make sure the folder exists (in case the volume isn't mounted yet)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS art_trade_pool (
+            user_id INTEGER PRIMARY KEY,
+            size TEXT NOT NULL,
+            style TEXT NOT NULL,
+            medium TEXT NOT NULL,
+            character TEXT NOT NULL,
+            match_size INTEGER NOT NULL,
+            match_style INTEGER NOT NULL,
+            match_medium INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS commissions (
+            user_id INTEGER PRIMARY KEY,
+            slots INTEGER,
+            where_link TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+    print(f"💾 Database ready at {DB_PATH}")
+
+
+def db_add_entry(entry):
+    conn = get_db()
+    conn.execute("""
+        INSERT OR REPLACE INTO art_trade_pool
+        (user_id, size, style, medium, character, match_size, match_style, match_medium)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        entry["user_id"], entry["size"], entry["style"], entry["medium"], entry["character"],
+        int(entry["match_size"]), int(entry["match_style"]), int(entry["match_medium"]),
+    ))
+    conn.commit()
+    conn.close()
+
+
+def db_remove_entry(user_id):
+    conn = get_db()
+    conn.execute("DELETE FROM art_trade_pool WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_load_all_entries():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM art_trade_pool").fetchall()
+    conn.close()
+    entries = {}
+    for row in rows:
+        entries[row["user_id"]] = {
+            "user_id": row["user_id"],
+            "size": row["size"],
+            "style": row["style"],
+            "medium": row["medium"],
+            "character": row["character"],
+            "match_size": bool(row["match_size"]),
+            "match_style": bool(row["match_style"]),
+            "match_medium": bool(row["match_medium"]),
+        }
+    return entries
+
+
+# --- Commission helpers ---
+
+def db_set_commission(user_id, slots, where_link):
+    conn = get_db()
+    conn.execute("""
+        INSERT OR REPLACE INTO commissions (user_id, slots, where_link)
+        VALUES (?, ?, ?)
+    """, (user_id, slots, where_link))
+    conn.commit()
+    conn.close()
+
+
+def db_remove_commission(user_id):
+    conn = get_db()
+    conn.execute("DELETE FROM commissions WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def db_get_commission(user_id):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM commissions WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    if row:
+        return {"user_id": row["user_id"], "slots": row["slots"], "where": row["where_link"]}
+    return None
+
+
+def db_load_all_commissions():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM commissions").fetchall()
+    conn.close()
+    return [{"user_id": row["user_id"], "slots": row["slots"], "where": row["where_link"]} for row in rows]
+
+
 # ============================================================
 #  BOT SETUP
 # ============================================================
@@ -36,7 +155,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Stores when each user's Active role should expire
 # Format: { user_id: datetime }
@@ -44,6 +163,285 @@ expiry_times = {}
 
 # Track which giveaway messages we've already pinged for (avoid double pinging)
 pinged_giveaways = set()
+
+# ============================================================
+#  ART TRADE POOL (loaded from SQLite on startup, kept in memory + synced)
+# ============================================================
+
+art_trade_pool = {}  # populated in on_ready via db_load_all_entries()
+
+SIZE_CHOICES = ["Headshot", "Fullbody", "Full Scene"]
+STYLE_CHOICES = ["Anthro", "Quad", "Human", "Other"]
+MEDIUM_CHOICES = ["Digital", "Traditional"]
+
+
+def entries_match(a, b):
+    """Check if two art trade entries are compatible with each other."""
+    if a["user_id"] == b["user_id"]:
+        return False
+
+    if a["match_size"] and a["size"] != b["size"]:
+        return False
+    if a["match_style"] and a["style"] != b["style"]:
+        return False
+    if a["match_medium"] and a["medium"] != b["medium"]:
+        return False
+
+    if b["match_size"] and b["size"] != a["size"]:
+        return False
+    if b["match_style"] and b["style"] != a["style"]:
+        return False
+    if b["match_medium"] and b["medium"] != a["medium"]:
+        return False
+
+    return True
+
+
+class MatchConfirmView(discord.ui.View):
+    """Buttons shown in the DM asking a user to confirm or decline the match."""
+
+    def __init__(self, entry_a, entry_b):
+        super().__init__(timeout=86400)  # 24 hours to respond
+        self.entry_a = entry_a
+        self.entry_b = entry_b
+        self.responses = {}  # user_id -> True/False
+
+    async def handle_response(self, interaction: discord.Interaction, accepted: bool):
+        self.responses[interaction.user.id] = accepted
+
+        if not accepted:
+            await interaction.response.edit_message(
+                content="You declined this match. The other user will be notified.",
+                view=None
+            )
+            other_id = self.entry_b["user_id"] if interaction.user.id == self.entry_a["user_id"] else self.entry_a["user_id"]
+            try:
+                other_user = await bot.fetch_user(other_id)
+                await other_user.send("The other person declined the art trade match. You're still in the pool!")
+            except Exception:
+                pass
+            return
+
+        await interaction.response.edit_message(
+            content="✅ You accepted! Waiting to see if the other person accepts too...",
+            view=None
+        )
+
+        a_id = self.entry_a["user_id"]
+        b_id = self.entry_b["user_id"]
+        if self.responses.get(a_id) and self.responses.get(b_id):
+            await finalize_match(self.entry_a, self.entry_b)
+
+    @discord.ui.button(label="Accept Match", style=discord.ButtonStyle.success, emoji="✅")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_response(interaction, True)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌")
+    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.handle_response(interaction, False)
+
+
+class StayOrLeaveView(discord.ui.View):
+    """Asks a matched user whether to stay in the pool or be removed."""
+
+    def __init__(self, user_id):
+        super().__init__(timeout=86400)
+        self.user_id = user_id
+
+    @discord.ui.button(label="Remove me from the pool", style=discord.ButtonStyle.secondary)
+    async def remove(self, interaction: discord.Interaction, button: discord.ui.Button):
+        art_trade_pool.pop(self.user_id, None)
+        db_remove_entry(self.user_id)
+        await interaction.response.edit_message(content="You've been removed from the art trade pool. Good luck with your trade! 🎨", view=None)
+
+    @discord.ui.button(label="Keep me in the pool", style=discord.ButtonStyle.primary)
+    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="You'll stay in the pool in case another good match comes along! 🎨", view=None)
+
+
+async def finalize_match(entry_a, entry_b):
+    """Called when both users have accepted the match."""
+    try:
+        user_a = await bot.fetch_user(entry_a["user_id"])
+        user_b = await bot.fetch_user(entry_b["user_id"])
+
+        await user_a.send(
+            f"🎉 It's a match! You and **{user_b.display_name}** both accepted the art trade!\n"
+            f"Their character: **{entry_b['character']}**\n\n"
+            f"Reach out to them to get started! Would you like to stay in the pool for future matches?",
+            view=StayOrLeaveView(entry_a["user_id"])
+        )
+        await user_b.send(
+            f"🎉 It's a match! You and **{user_a.display_name}** both accepted the art trade!\n"
+            f"Their character: **{entry_a['character']}**\n\n"
+            f"Reach out to them to get started! Would you like to stay in the pool for future matches?",
+            view=StayOrLeaveView(entry_b["user_id"])
+        )
+        print(f"🎉 Art trade match finalized: {user_a.display_name} <-> {user_b.display_name}")
+    except Exception as e:
+        print(f"⚠️ Could not finalize match: {e}")
+
+
+@bot.tree.command(name="arttrade", description="Submit a request to find an art trade partner")
+@app_commands.describe(
+    size="What size art are you offering/looking for?",
+    style="What style are you offering/looking for?",
+    medium="What medium are you offering/looking for?",
+    character="The character you want drawn",
+    match_size="Require your partner's size to match yours? (default: yes)",
+    match_style="Require your partner's style to match yours? (default: yes)",
+    match_medium="Require your partner's medium to match yours? (default: no)",
+)
+@app_commands.choices(
+    size=[app_commands.Choice(name=s, value=s) for s in SIZE_CHOICES],
+    style=[app_commands.Choice(name=s, value=s) for s in STYLE_CHOICES],
+    medium=[app_commands.Choice(name=s, value=s) for s in MEDIUM_CHOICES],
+)
+async def arttrade(
+    interaction: discord.Interaction,
+    size: app_commands.Choice[str],
+    style: app_commands.Choice[str],
+    medium: app_commands.Choice[str],
+    character: str,
+    match_size: bool = True,
+    match_style: bool = True,
+    match_medium: bool = False,
+):
+    new_entry = {
+        "user_id": interaction.user.id,
+        "size": size.value,
+        "style": style.value,
+        "medium": medium.value,
+        "character": character,
+        "match_size": match_size,
+        "match_style": match_style,
+        "match_medium": match_medium,
+    }
+
+    found_match = None
+    for existing_entry in art_trade_pool.values():
+        if entries_match(new_entry, existing_entry):
+            found_match = existing_entry
+            break
+
+    art_trade_pool[interaction.user.id] = new_entry
+    db_add_entry(new_entry)  # persist to SQLite
+
+    await interaction.response.send_message(
+        "✅ You've been added to the art trade pool! I'll DM you if a match is found.",
+        ephemeral=True
+    )
+
+    if found_match:
+        try:
+            user_a = await bot.fetch_user(new_entry["user_id"])
+            user_b = await bot.fetch_user(found_match["user_id"])
+
+            await user_a.send(
+                f"🎨 A potential art trade match was found!\n"
+                f"**{user_b.display_name}** wants: {found_match['size']} / {found_match['style']} / {found_match['medium']}\n"
+                f"Character: **{found_match['character']}**\n\n"
+                f"Do you want to accept this match?",
+                view=MatchConfirmView(new_entry, found_match)
+            )
+            await user_b.send(
+                f"🎨 A potential art trade match was found!\n"
+                f"**{user_a.display_name}** wants: {new_entry['size']} / {new_entry['style']} / {new_entry['medium']}\n"
+                f"Character: **{new_entry['character']}**\n\n"
+                f"Do you want to accept this match?",
+                view=MatchConfirmView(new_entry, found_match)
+            )
+            print(f"🎨 Potential match found: {user_a.display_name} <-> {user_b.display_name}")
+        except Exception as e:
+            print(f"⚠️ Could not send match DMs: {e}")
+
+
+@bot.tree.command(name="cancel", description="Withdraw your art trade request from the pool")
+async def cancel(interaction: discord.Interaction):
+    if interaction.user.id in art_trade_pool:
+        del art_trade_pool[interaction.user.id]
+        db_remove_entry(interaction.user.id)
+        await interaction.response.send_message("You've been removed from the art trade pool.", ephemeral=True)
+    else:
+        await interaction.response.send_message("You don't have an active art trade request.", ephemeral=True)
+
+
+# ============================================================
+#  COMMISSIONS
+# ============================================================
+
+@bot.tree.command(name="listcomm", description="List your open commissions")
+@app_commands.describe(
+    where="Where to find/order your commissions (link or description)",
+    slots="Number of open slots (leave blank for unlimited/until you close it)",
+)
+async def listcomm(interaction: discord.Interaction, where: str, slots: int = None):
+    db_set_commission(interaction.user.id, slots, where)
+    slots_text = f"{slots} slot(s)" if slots is not None else "unlimited slots"
+    await interaction.response.send_message(
+        f"✅ Your commissions are now listed as open with {slots_text}!\nUse `/updatecomm` to change your slot count, or `/closecomm` to remove your listing.",
+        ephemeral=True
+    )
+    print(f"🖌️ {interaction.user.display_name} listed commissions ({slots_text})")
+
+
+@bot.tree.command(name="updatecomm", description="Update your remaining commission slots")
+@app_commands.describe(slots="Your new number of open slots")
+async def updatecomm(interaction: discord.Interaction, slots: int):
+    existing = db_get_commission(interaction.user.id)
+    if not existing:
+        await interaction.response.send_message(
+            "You don't have an active commission listing. Use `/listcomm` first!",
+            ephemeral=True
+        )
+        return
+
+    db_set_commission(interaction.user.id, slots, existing["where"])
+    await interaction.response.send_message(f"✅ Updated! You now have {slots} slot(s) open.", ephemeral=True)
+    print(f"🖌️ {interaction.user.display_name} updated commission slots to {slots}")
+
+
+@bot.tree.command(name="closecomm", description="Remove your commission listing")
+async def closecomm(interaction: discord.Interaction):
+    existing = db_get_commission(interaction.user.id)
+    if not existing:
+        await interaction.response.send_message("You don't have an active commission listing.", ephemeral=True)
+        return
+
+    db_remove_commission(interaction.user.id)
+    await interaction.response.send_message("Your commission listing has been removed.", ephemeral=True)
+    print(f"🖌️ {interaction.user.display_name} closed their commission listing")
+
+
+@bot.tree.command(name="opencomms", description="Get a DM with everyone currently offering open commissions")
+async def opencomms(interaction: discord.Interaction):
+    all_comms = db_load_all_commissions()
+
+    if not all_comms:
+        await interaction.response.send_message("No one currently has open commissions listed.", ephemeral=True)
+        return
+
+    lines = []
+    for comm in all_comms:
+        try:
+            user = await bot.fetch_user(comm["user_id"])
+            name = user.display_name
+        except Exception:
+            name = f"User {comm['user_id']}"
+
+        slots_text = f"{comm['slots']} slot(s)" if comm["slots"] is not None else "Unlimited slots"
+        lines.append(f"**{name}** — {slots_text}\n{comm['where']}")
+
+    message_text = "🖌️ **Currently Open Commissions**\n\n" + "\n\n".join(lines)
+
+    try:
+        await interaction.user.send(message_text)
+        await interaction.response.send_message("📬 Sent you a DM with the current list!", ephemeral=True)
+    except Exception:
+        await interaction.response.send_message(
+            "⚠️ I couldn't DM you — please check your privacy settings allow DMs from server members.",
+            ephemeral=True
+        )
 
 
 # ============================================================
@@ -63,7 +461,6 @@ async def maybe_ping_giveaway(message):
     if GIVEAWAY_BOT_ROLE not in author_role_names:
         return
 
-    # Check embeds for "Ends:" but not "Ended:"
     embed_text = ""
     for embed in message.embeds:
         if embed.title:
@@ -75,16 +472,8 @@ async def maybe_ping_giveaway(message):
         for field in embed.fields:
             embed_text += field.name + " " + field.value + " "
 
-    print(f"🔍 GiveawayBot embed text: '{embed_text[:200]}'")
-
-    if "Ends:" in embed_text and "Ended:" not in embed_text:
-        print(f"✅ Fresh giveaway detected!")
-    elif "Ends:" in embed_text and "Ended:" in embed_text:
-        print(f"⚠️ Both Ends: and Ended: found — treating as ended, skipping")
-
     if "Ends:" in embed_text and "Ended:" not in embed_text:
         ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
-        print(f"🔍 Looking for role '{GIVEAWAY_PING_ROLE}' — found: {ping_role}")
         if ping_role:
             pinged_giveaways.add(message.id)
             await message.channel.send(ping_role.mention)
@@ -96,23 +485,21 @@ async def maybe_ping_giveaway(message):
 # ============================================================
 
 async def startup_activity_check():
-    await client.wait_until_ready()
+    await bot.wait_until_ready()
     print(f"🔍 Running startup activity check...")
 
-    for guild in client.guilds:
+    for guild in bot.guilds:
         active_role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
         if not active_role:
             print(f"⚠️ Role '{ACTIVE_ROLE_NAME}' not found in {guild.name}")
             continue
 
-        # Get all channels we should check (excluding ignored ones)
         valid_channels = [
             c for c in guild.text_channels
             if c.name not in IGNORED_CHANNELS
             and c.name != GIVEAWAY_CHANNEL
         ]
 
-        # Get all members with the Active role
         active_members = [m for m in guild.members if active_role in m.roles]
         print(f"📋 Checking {len(active_members)} members with Active role...")
 
@@ -122,7 +509,6 @@ async def startup_activity_check():
             if member.bot:
                 continue
 
-            # Check if they've posted in any valid channel in the last 30 days
             last_post = None
             for channel in valid_channels:
                 try:
@@ -135,12 +521,10 @@ async def startup_activity_check():
                     continue
 
             if last_post:
-                # They've been active — set their expiry from their last post
                 expiry = last_post + timedelta(days=ACTIVE_DURATION_DAYS)
                 expiry_times[member.id] = expiry
                 print(f"✅ {member.display_name} — last post {last_post.strftime('%Y-%m-%d')}, expires {expiry.strftime('%Y-%m-%d')}")
             else:
-                # No post found in last 30 days — remove Active role
                 try:
                     await member.remove_roles(active_role)
                     print(f"⏰ Removed '{ACTIVE_ROLE_NAME}' from {member.display_name} (no posts in 30 days)")
@@ -154,15 +538,27 @@ async def startup_activity_check():
 #  EVENTS
 # ============================================================
 
-@client.event
+@bot.event
 async def on_ready():
-    print(f"✅ Logged in as {client.user}")
+    print(f"✅ Logged in as {bot.user}")
     print(f"📋 Watching for activity | Role: '{ACTIVE_ROLE_NAME}' | Window: {ACTIVE_DURATION_DAYS} days")
-    client.loop.create_task(check_expirations())
-    client.loop.create_task(startup_activity_check())
+
+    # Load persisted art trade pool from SQLite
+    global art_trade_pool
+    art_trade_pool = db_load_all_entries()
+    print(f"🎨 Loaded {len(art_trade_pool)} art trade entries from database")
+
+    try:
+        synced = await bot.tree.sync()
+        print(f"🔄 Synced {len(synced)} slash commands")
+    except Exception as e:
+        print(f"⚠️ Failed to sync slash commands: {e}")
+
+    bot.loop.create_task(check_expirations())
+    bot.loop.create_task(startup_activity_check())
 
 
-@client.event
+@bot.event
 async def on_message(message):
     if message.guild is None:
         return
@@ -172,16 +568,13 @@ async def on_message(message):
     # --------------------------------------------------------
     if message.channel.name == GIVEAWAY_CHANNEL:
 
-        # Never touch the bot's own messages
-        if message.author == client.user:
+        if message.author == bot.user:
             return
 
         if message.author.bot:
-            # Try to ping immediately (works if embed is already attached)
             await maybe_ping_giveaway(message)
             return
 
-        # Regular member message — silently delete after 10 minutes
         async def delayed_delete(msg):
             await asyncio.sleep(GIVEAWAY_DELETE_SECONDS)
             try:
@@ -193,11 +586,9 @@ async def on_message(message):
         asyncio.ensure_future(delayed_delete(message))
         return
 
-    # Ignore all other bot messages
     if message.author.bot:
         return
 
-    # Ignore configured channels for activity tracking
     if message.channel.name in IGNORED_CHANNELS:
         return
 
@@ -219,10 +610,8 @@ async def on_message(message):
         print(f"✅ Gave '{ACTIVE_ROLE_NAME}' to {member.display_name}")
 
 
-@client.event
+@bot.event
 async def on_message_edit(before, after):
-    # GiveawayBot often edits its message to attach the embed
-    # This catches it the moment the embed appears
     if after.guild is None:
         return
     if after.channel.name != GIVEAWAY_CHANNEL:
@@ -237,14 +626,14 @@ async def on_message_edit(before, after):
 # ============================================================
 
 async def check_expirations():
-    await client.wait_until_ready()
-    while not client.is_closed():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
         now = datetime.now(timezone.utc)
         to_remove = [uid for uid, exp in expiry_times.items() if now >= exp]
 
         for user_id in to_remove:
             del expiry_times[user_id]
-            for guild in client.guilds:
+            for guild in bot.guilds:
                 member = guild.get_member(user_id)
                 if member:
                     role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
@@ -259,4 +648,5 @@ async def check_expirations():
 #  RUN
 # ============================================================
 
-client.run(BOT_TOKEN)
+init_db()
+bot.run(BOT_TOKEN)

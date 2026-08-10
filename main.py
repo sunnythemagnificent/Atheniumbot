@@ -282,15 +282,15 @@ async def finalize_match(entry_a, entry_b):
         print(f"⚠️ Could not finalize match: {e}")
 
 
-@bot.tree.command(name="arttrade", description="Submit a request to find an art trade partner")
+@bot.tree.command(name="arttrade", description="Submit a request to find an art trade partner (by default, only Size needs to match)")
 @app_commands.describe(
     size="What size art are you offering/looking for?",
+    require_matching_size="🎯 Require your partner's SIZE to match yours? (default: YES)",
     style="What style are you offering/looking for?",
+    require_matching_style="🎯 Require your partner's STYLE to match yours too? (default: no)",
     medium="What medium are you offering/looking for?",
+    require_matching_medium="🎯 Require your partner's MEDIUM to match yours too? (default: no)",
     character="The character you want drawn",
-    match_size="Require your partner's size to match yours? (default: yes)",
-    match_style="Require your partner's style to match yours? (default: yes)",
-    match_medium="Require your partner's medium to match yours? (default: no)",
 )
 @app_commands.choices(
     size=[app_commands.Choice(name=s, value=s) for s in SIZE_CHOICES],
@@ -303,10 +303,14 @@ async def arttrade(
     style: app_commands.Choice[str],
     medium: app_commands.Choice[str],
     character: str,
-    match_size: bool = True,
-    match_style: bool = True,
-    match_medium: bool = False,
+    require_matching_size: bool = True,
+    require_matching_style: bool = False,
+    require_matching_medium: bool = False,
 ):
+    match_size = require_matching_size
+    match_style = require_matching_style
+    match_medium = require_matching_medium
+
     new_entry = {
         "user_id": interaction.user.id,
         "size": size.value,
@@ -327,8 +331,29 @@ async def arttrade(
     art_trade_pool[interaction.user.id] = new_entry
     db_add_entry(new_entry)  # persist to SQLite
 
+    print(f"🎨 {interaction.user.display_name} submitted art trade request — "
+          f"Size: {new_entry['size']}, Style: {new_entry['style']}, Medium: {new_entry['medium']}, "
+          f"Character: {new_entry['character']} "
+          f"(match_size={match_size}, match_style={match_style}, match_medium={match_medium})")
+
+    if found_match:
+        print(f"🎨 Potential match found with {found_match['user_id']}!")
+    else:
+        print(f"🎨 No match found yet for {interaction.user.display_name} — added to pool ({len(art_trade_pool)} total in pool)")
+
+    criteria_note = []
+    if match_size:
+        criteria_note.append("Size")
+    if match_style:
+        criteria_note.append("Style")
+    if match_medium:
+        criteria_note.append("Medium")
+    criteria_text = ", ".join(criteria_note) if criteria_note else "nothing (any partner works!)"
+
     await interaction.response.send_message(
-        "✅ You've been added to the art trade pool! I'll DM you if a match is found.",
+        f"✅ You've been added to the art trade pool!\n"
+        f"**Must match:** {criteria_text}\n"
+        f"I'll DM you if a match is found. Use `/cancel` anytime to withdraw.",
         ephemeral=True
     )
 
@@ -505,20 +530,29 @@ async def startup_activity_check():
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=ACTIVE_DURATION_DAYS)
 
+        # Build a map of user_id -> most recent post time by scanning each
+        # channel ONCE (newest messages first), instead of per-member per-channel.
+        # This avoids missing posts in busy channels that have 500+ messages
+        # since the cutoff date.
+        last_post_map = {}
+
+        for channel in valid_channels:
+            try:
+                async for msg in channel.history(limit=None, after=cutoff, oldest_first=False):
+                    if msg.author.bot:
+                        continue
+                    existing = last_post_map.get(msg.author.id)
+                    if existing is None or msg.created_at > existing:
+                        last_post_map[msg.author.id] = msg.created_at
+            except Exception as e:
+                print(f"⚠️ Could not scan #{channel.name}: {e}")
+                continue
+
         for member in active_members:
             if member.bot:
                 continue
 
-            last_post = None
-            for channel in valid_channels:
-                try:
-                    async for msg in channel.history(limit=500, after=cutoff):
-                        if msg.author.id == member.id:
-                            if last_post is None or msg.created_at > last_post:
-                                last_post = msg.created_at
-                            break
-                except Exception:
-                    continue
+            last_post = last_post_map.get(member.id)
 
             if last_post:
                 expiry = last_post + timedelta(days=ACTIVE_DURATION_DAYS)
@@ -530,6 +564,25 @@ async def startup_activity_check():
                     print(f"⏰ Removed '{ACTIVE_ROLE_NAME}' from {member.display_name} (no posts in 30 days)")
                 except Exception as e:
                     print(f"⚠️ Could not remove role from {member.display_name}: {e}")
+
+        # Also check anyone who posted recently but is MISSING the Active role
+        # (e.g. wrongly removed by a previous buggy run) and restore it
+        active_member_ids = {m.id for m in active_members}
+        for user_id, last_post in last_post_map.items():
+            if user_id in active_member_ids:
+                continue  # already handled above
+
+            member = guild.get_member(user_id)
+            if not member or member.bot:
+                continue
+
+            try:
+                await member.add_roles(active_role)
+                expiry = last_post + timedelta(days=ACTIVE_DURATION_DAYS)
+                expiry_times[member.id] = expiry
+                print(f"🔧 Restored 'Active' to {member.display_name} — last post {last_post.strftime('%Y-%m-%d')} (was missing the role)")
+            except Exception as e:
+                print(f"⚠️ Could not restore role for {member.display_name}: {e}")
 
     print(f"✅ Startup activity check complete!")
 

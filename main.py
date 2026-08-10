@@ -79,8 +79,10 @@ def db_add_entry(entry):
         (user_id, size, style, medium, character, match_size, match_style, match_medium)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        entry["user_id"], entry["size"], entry["style"], entry["medium"], entry["character"],
-        int(entry["match_size"]), int(entry["match_style"]), int(entry["match_medium"]),
+        entry["user_id"],
+        ",".join(entry["size"]), ",".join(entry["style"]), ",".join(entry["medium"]),
+        entry["character"],
+        0, 0, 0,  # legacy columns, unused now that matching is list-based
     ))
     conn.commit()
     conn.close()
@@ -101,13 +103,10 @@ def db_load_all_entries():
     for row in rows:
         entries[row["user_id"]] = {
             "user_id": row["user_id"],
-            "size": row["size"],
-            "style": row["style"],
-            "medium": row["medium"],
+            "size": row["size"].split(",") if row["size"] else [],
+            "style": row["style"].split(",") if row["style"] else [],
+            "medium": row["medium"].split(",") if row["medium"] else [],
             "character": row["character"],
-            "match_size": bool(row["match_size"]),
-            "match_style": bool(row["match_style"]),
-            "match_medium": bool(row["match_medium"]),
         }
     return entries
 
@@ -176,25 +175,22 @@ MEDIUM_CHOICES = ["Digital", "Traditional"]
 
 
 def entries_match(a, b):
-    """Check if two art trade entries are compatible with each other."""
+    """Two entries match if EVERY field has at least one overlapping option."""
     if a["user_id"] == b["user_id"]:
         return False
 
-    if a["match_size"] and a["size"] != b["size"]:
+    if not set(a["size"]) & set(b["size"]):
         return False
-    if a["match_style"] and a["style"] != b["style"]:
+    if not set(a["style"]) & set(b["style"]):
         return False
-    if a["match_medium"] and a["medium"] != b["medium"]:
-        return False
-
-    if b["match_size"] and b["size"] != a["size"]:
-        return False
-    if b["match_style"] and b["style"] != a["style"]:
-        return False
-    if b["match_medium"] and b["medium"] != a["medium"]:
+    if not set(a["medium"]) & set(b["medium"]):
         return False
 
     return True
+
+
+def format_list(values):
+    return ", ".join(values)
 
 
 class MatchConfirmView(discord.ui.View):
@@ -282,44 +278,14 @@ async def finalize_match(entry_a, entry_b):
         print(f"⚠️ Could not finalize match: {e}")
 
 
-@bot.tree.command(name="arttrade", description="Submit a request to find an art trade partner (by default, only Size needs to match)")
-@app_commands.describe(
-    size="What size art are you offering/looking for?",
-    require_matching_size="🎯 Require your partner's SIZE to match yours? (default: YES)",
-    style="What style are you offering/looking for?",
-    require_matching_style="🎯 Require your partner's STYLE to match yours too? (default: no)",
-    medium="What medium are you offering/looking for?",
-    require_matching_medium="🎯 Require your partner's MEDIUM to match yours too? (default: no)",
-    character="The character you want drawn",
-)
-@app_commands.choices(
-    size=[app_commands.Choice(name=s, value=s) for s in SIZE_CHOICES],
-    style=[app_commands.Choice(name=s, value=s) for s in STYLE_CHOICES],
-    medium=[app_commands.Choice(name=s, value=s) for s in MEDIUM_CHOICES],
-)
-async def arttrade(
-    interaction: discord.Interaction,
-    size: app_commands.Choice[str],
-    style: app_commands.Choice[str],
-    medium: app_commands.Choice[str],
-    character: str,
-    require_matching_size: bool = True,
-    require_matching_style: bool = False,
-    require_matching_medium: bool = False,
-):
-    match_size = require_matching_size
-    match_style = require_matching_style
-    match_medium = require_matching_medium
-
+async def process_art_trade_submission(interaction: discord.Interaction, sizes, styles, mediums, character):
+    """Shared logic for finalizing an art trade submission once all selections are made."""
     new_entry = {
         "user_id": interaction.user.id,
-        "size": size.value,
-        "style": style.value,
-        "medium": medium.value,
+        "size": sizes,
+        "style": styles,
+        "medium": mediums,
         "character": character,
-        "match_size": match_size,
-        "match_style": match_style,
-        "match_medium": match_medium,
     }
 
     found_match = None
@@ -332,29 +298,25 @@ async def arttrade(
     db_add_entry(new_entry)  # persist to SQLite
 
     print(f"🎨 {interaction.user.display_name} submitted art trade request — "
-          f"Size: {new_entry['size']}, Style: {new_entry['style']}, Medium: {new_entry['medium']}, "
-          f"Character: {new_entry['character']} "
-          f"(match_size={match_size}, match_style={match_style}, match_medium={match_medium})")
+          f"Size: {format_list(sizes)}, Style: {format_list(styles)}, Medium: {format_list(mediums)}, "
+          f"Character: {character}")
 
     if found_match:
-        print(f"🎨 Potential match found with {found_match['user_id']}!")
+        print(f"🎨 Potential match found with user {found_match['user_id']}!")
     else:
         print(f"🎨 No match found yet for {interaction.user.display_name} — added to pool ({len(art_trade_pool)} total in pool)")
 
-    criteria_note = []
-    if match_size:
-        criteria_note.append("Size")
-    if match_style:
-        criteria_note.append("Style")
-    if match_medium:
-        criteria_note.append("Medium")
-    criteria_text = ", ".join(criteria_note) if criteria_note else "nothing (any partner works!)"
-
-    await interaction.response.send_message(
-        f"✅ You've been added to the art trade pool!\n"
-        f"**Must match:** {criteria_text}\n"
-        f"I'll DM you if a match is found. Use `/cancel` anytime to withdraw.",
-        ephemeral=True
+    await interaction.response.edit_message(
+        content=(
+            f"✅ You've been added to the art trade pool!\n"
+            f"**Size:** {format_list(sizes)}\n"
+            f"**Style:** {format_list(styles)}\n"
+            f"**Medium:** {format_list(mediums)}\n"
+            f"**Character:** {character}\n\n"
+            f"💡 Tip: selecting *all* options for a field means you don't mind what your partner offers there.\n"
+            f"I'll DM you if a match is found. Use `/cancel` anytime to withdraw."
+        ),
+        view=None
     )
 
     if found_match:
@@ -364,14 +326,16 @@ async def arttrade(
 
             await user_a.send(
                 f"🎨 A potential art trade match was found!\n"
-                f"**{user_b.display_name}** wants: {found_match['size']} / {found_match['style']} / {found_match['medium']}\n"
+                f"**{user_b.display_name}** offers: {format_list(found_match['size'])} / "
+                f"{format_list(found_match['style'])} / {format_list(found_match['medium'])}\n"
                 f"Character: **{found_match['character']}**\n\n"
                 f"Do you want to accept this match?",
                 view=MatchConfirmView(new_entry, found_match)
             )
             await user_b.send(
                 f"🎨 A potential art trade match was found!\n"
-                f"**{user_a.display_name}** wants: {new_entry['size']} / {new_entry['style']} / {new_entry['medium']}\n"
+                f"**{user_a.display_name}** offers: {format_list(new_entry['size'])} / "
+                f"{format_list(new_entry['style'])} / {format_list(new_entry['medium'])}\n"
                 f"Character: **{new_entry['character']}**\n\n"
                 f"Do you want to accept this match?",
                 view=MatchConfirmView(new_entry, found_match)
@@ -379,6 +343,81 @@ async def arttrade(
             print(f"🎨 Potential match found: {user_a.display_name} <-> {user_b.display_name}")
         except Exception as e:
             print(f"⚠️ Could not send match DMs: {e}")
+
+
+class ArtTradeSelectView(discord.ui.View):
+    """Multi-select dropdowns for Size, Style, and Medium, plus a Submit button."""
+
+    def __init__(self, character):
+        super().__init__(timeout=300)  # 5 minutes to finish selecting
+        self.character = character
+        self.selected_sizes = []
+        self.selected_styles = []
+        self.selected_mediums = []
+
+        self.size_select = discord.ui.Select(
+            placeholder="🖼️ Select size(s) you're offering/looking for...",
+            min_values=1,
+            max_values=len(SIZE_CHOICES),
+            options=[discord.SelectOption(label=s) for s in SIZE_CHOICES],
+        )
+        self.size_select.callback = self.on_size_select
+        self.add_item(self.size_select)
+
+        self.style_select = discord.ui.Select(
+            placeholder="🎨 Select style(s) you're offering/looking for...",
+            min_values=1,
+            max_values=len(STYLE_CHOICES),
+            options=[discord.SelectOption(label=s) for s in STYLE_CHOICES],
+        )
+        self.style_select.callback = self.on_style_select
+        self.add_item(self.style_select)
+
+        self.medium_select = discord.ui.Select(
+            placeholder="✏️ Select medium(s) you're offering/looking for...",
+            min_values=1,
+            max_values=len(MEDIUM_CHOICES),
+            options=[discord.SelectOption(label=s) for s in MEDIUM_CHOICES],
+        )
+        self.medium_select.callback = self.on_medium_select
+        self.add_item(self.medium_select)
+
+    async def on_size_select(self, interaction: discord.Interaction):
+        self.selected_sizes = self.size_select.values
+        await interaction.response.defer()
+
+    async def on_style_select(self, interaction: discord.Interaction):
+        self.selected_styles = self.style_select.values
+        await interaction.response.defer()
+
+    async def on_medium_select(self, interaction: discord.Interaction):
+        self.selected_mediums = self.medium_select.values
+        await interaction.response.defer()
+
+    @discord.ui.button(label="Submit Art Trade Request", style=discord.ButtonStyle.success, emoji="🎨", row=3)
+    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected_sizes or not self.selected_styles or not self.selected_mediums:
+            await interaction.response.send_message(
+                "⚠️ Please select at least one option in each dropdown (Size, Style, Medium) before submitting!",
+                ephemeral=True
+            )
+            return
+
+        await process_art_trade_submission(
+            interaction, self.selected_sizes, self.selected_styles, self.selected_mediums, self.character
+        )
+
+
+@bot.tree.command(name="arttrade", description="Submit a request to find an art trade partner")
+@app_commands.describe(character="The character you want drawn")
+async def arttrade(interaction: discord.Interaction, character: str):
+    await interaction.response.send_message(
+        "🎨 Pick your Size, Style, and Medium below — you can select **multiple** options in each! "
+        "Then hit Submit.\n\n"
+        "💡 Tip: selecting *all* options for a field means you're flexible and don't mind what your partner offers there.",
+        view=ArtTradeSelectView(character),
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="cancel", description="Withdraw your art trade request from the pool")

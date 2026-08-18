@@ -509,6 +509,134 @@ async def opencomms(interaction: discord.Interaction):
 
 
 # ============================================================
+#  FAIR TRADE CALCULATOR
+# ============================================================
+
+def parse_items(text):
+    """Parse 'Item Name:Value, Item Name:Value' into a list of (name, value) tuples."""
+    items = []
+    errors = []
+    if not text or not text.strip():
+        return items, errors
+
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            errors.append(chunk)
+            continue
+        name, _, value_str = chunk.rpartition(":")
+        name = name.strip()
+        value_str = value_str.strip()
+        try:
+            value = float(value_str)
+            items.append((name, value))
+        except ValueError:
+            errors.append(chunk)
+
+    return items, errors
+
+
+def find_best_removal_subset(items, target_diff):
+    """
+    Find the subset of `items` whose combined value is closest to target_diff.
+    Removing this subset from the heavier side would make both sides closest to equal.
+    Brute force — fine for small item counts (capped at 15 for safety).
+    """
+    if not items or len(items) > 15:
+        return None, None
+
+    best_subset = None
+    best_diff = None
+
+    n = len(items)
+    for mask in range(1, 1 << n):
+        subset = [items[i] for i in range(n) if mask & (1 << i)]
+        subset_value = sum(v for _, v in subset)
+        diff_from_target = abs(subset_value - target_diff)
+
+        if best_diff is None or diff_from_target < best_diff:
+            best_diff = diff_from_target
+            best_subset = subset
+
+    return best_subset, best_diff
+
+
+class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
+    your_items = discord.ui.TextInput(
+        label="Your items (Name:Value, Name:Value, ...)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Liquid Glass Filter:4, Subtle Blush:2",
+        required=True,
+    )
+    their_items = discord.ui.TextInput(
+        label="Their items (Name:Value, Name:Value, ...)",
+        style=discord.TextStyle.paragraph,
+        placeholder="Pfish Trinket:3, Oversized Witch Hat:5",
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        your_list, your_errors = parse_items(self.your_items.value)
+        their_list, their_errors = parse_items(self.their_items.value)
+
+        if your_errors or their_errors:
+            bad = your_errors + their_errors
+            await interaction.response.send_message(
+                f"⚠️ Couldn't parse these entries (make sure it's `Name:Value`): {', '.join(bad)}",
+                ephemeral=True
+            )
+            return
+
+        if not your_list or not their_list:
+            await interaction.response.send_message(
+                "⚠️ Please list at least one item on each side.",
+                ephemeral=True
+            )
+            return
+
+        your_total = sum(v for _, v in your_list)
+        their_total = sum(v for _, v in their_list)
+        diff = round(your_total - their_total, 2)
+
+        lines = [
+            f"**Your side:** {', '.join(f'{n} ({v})' for n, v in your_list)} — Total: **{your_total}**",
+            f"**Their side:** {', '.join(f'{n} ({v})' for n, v in their_list)} — Total: **{their_total}**",
+            "",
+        ]
+
+        if diff == 0:
+            lines.append("✅ This trade is perfectly fair!")
+        else:
+            heavier_side = "yours" if diff > 0 else "theirs"
+            heavier_items = your_list if diff > 0 else their_list
+            target = abs(diff)
+
+            lines.append(f"⚖️ **{heavier_side.capitalize()}** side is worth **{target}** more.")
+
+            subset, subset_diff = find_best_removal_subset(heavier_items, target)
+            if subset:
+                subset_names = ", ".join(f"{n} ({v})" for n, v in subset)
+                subset_value = sum(v for _, v in subset)
+                lines.append(
+                    f"\n💡 To balance it out, consider removing **{subset_names}** "
+                    f"(worth {subset_value}) from the {heavier_side} side."
+                )
+                if round(subset_diff, 2) != 0:
+                    lines.append(f"(This would leave a small remaining gap of about {round(subset_diff, 2)}.)")
+            else:
+                lines.append(f"\n💡 Consider adding roughly **{target}** worth of items to the lighter side instead.")
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="fairtrade", description="Check if a Neocash trade is fair and get suggestions to balance it")
+async def fairtrade(interaction: discord.Interaction):
+    await interaction.response.send_modal(FairTradeModal())
+
+
+# ============================================================
 #  HELPER — check and ping for fresh giveaway
 # ============================================================
 

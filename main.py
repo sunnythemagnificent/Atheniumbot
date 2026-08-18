@@ -513,7 +513,10 @@ async def opencomms(interaction: discord.Interaction):
 # ============================================================
 
 def parse_items(text):
-    """Parse 'Item Name:Value, Item Name:Value' into a list of (name, value) tuples."""
+    """
+    Parse 'Item Name:Value, Item Name:Value' into a list of (name, value, is_priority) tuples.
+    Prefix an item name with * to mark it as a must-keep priority item, e.g. '*Liquid Glass Filter:4'
+    """
     items = []
     errors = []
     if not text or not text.strip():
@@ -529,49 +532,72 @@ def parse_items(text):
         name, _, value_str = chunk.rpartition(":")
         name = name.strip()
         value_str = value_str.strip()
+
+        is_priority = name.startswith("*")
+        if is_priority:
+            name = name[1:].strip()
+
         try:
             value = float(value_str)
-            items.append((name, value))
+            items.append((name, value, is_priority))
         except ValueError:
             errors.append(chunk)
 
     return items, errors
 
 
-def find_best_removal_subset(items, target_diff):
+def find_best_removal_subsets(items, target_diff, max_options=3):
     """
-    Find the subset of `items` whose combined value is closest to target_diff.
-    Removing this subset from the heavier side would make both sides closest to equal.
+    Find up to `max_options` distinct subsets of `items` whose combined value is
+    closest to target_diff. Removing any one of these subsets would balance the trade.
+    Priority items (is_priority=True) are NEVER included in the removable pool.
+    Results are ranked by closeness to target, then by fewest items removed.
     Brute force — fine for small item counts (capped at 15 for safety).
     """
-    if not items or len(items) > 15:
-        return None, None
+    removable_items = [item for item in items if not item[2]]
 
-    best_subset = None
-    best_diff = None
+    if not removable_items or len(removable_items) > 15:
+        return []
 
-    n = len(items)
+    all_subsets = []
+    n = len(removable_items)
     for mask in range(1, 1 << n):
-        subset = [items[i] for i in range(n) if mask & (1 << i)]
-        subset_value = sum(v for _, v in subset)
+        subset = [removable_items[i] for i in range(n) if mask & (1 << i)]
+        subset_value = sum(v for _, v, _ in subset)
         diff_from_target = abs(subset_value - target_diff)
+        all_subsets.append((subset, diff_from_target))
 
-        if best_diff is None or diff_from_target < best_diff:
-            best_diff = diff_from_target
-            best_subset = subset
+    # Sort by closeness to target first, then prefer fewer items removed
+    all_subsets.sort(key=lambda x: (round(x[1], 2), len(x[0])))
 
-    return best_subset, best_diff
+    # Only keep subsets with genuinely distinct item sets (dedupe by item names)
+    seen_signatures = set()
+    unique_options = []
+    for subset, diff_from_target in all_subsets:
+        signature = frozenset(n for n, _, _ in subset)
+        if signature in seen_signatures:
+            continue
+        seen_signatures.add(signature)
+        unique_options.append((subset, diff_from_target))
+        if len(unique_options) >= max_options:
+            break
+
+    return unique_options
+
+
+def format_items(items):
+    return ", ".join(f"⭐{n} ({v})" if p else f"{n} ({v})" for n, v, p in items)
 
 
 class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
     your_items = discord.ui.TextInput(
-        label="Your items (Name:Value, Name:Value, ...)",
+        label="Your items (Name:Value, *Priority:Value)",
         style=discord.TextStyle.paragraph,
-        placeholder="Liquid Glass Filter:4, Subtle Blush:2",
+        placeholder="Liquid Glass Filter:4, *Subtle Blush:2",
         required=True,
     )
     their_items = discord.ui.TextInput(
-        label="Their items (Name:Value, Name:Value, ...)",
+        label="Their items (Name:Value, *Priority:Value)",
         style=discord.TextStyle.paragraph,
         placeholder="Pfish Trinket:3, Oversized Witch Hat:5",
         required=True,
@@ -596,15 +622,17 @@ class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
             )
             return
 
-        your_total = sum(v for _, v in your_list)
-        their_total = sum(v for _, v in their_list)
+        your_total = sum(v for _, v, _ in your_list)
+        their_total = sum(v for _, v, _ in their_list)
         diff = round(your_total - their_total, 2)
 
         lines = [
-            f"**Your side:** {', '.join(f'{n} ({v})' for n, v in your_list)} — Total: **{your_total}**",
-            f"**Their side:** {', '.join(f'{n} ({v})' for n, v in their_list)} — Total: **{their_total}**",
+            f"**Your side:** {format_items(your_list)} — Total: **{your_total}**",
+            f"**Their side:** {format_items(their_list)} — Total: **{their_total}**",
             "",
         ]
+        if any(p for _, _, p in your_list) or any(p for _, _, p in their_list):
+            lines.append("⭐ = marked as a must-keep priority item (won't be suggested for removal)\n")
 
         if diff == 0:
             lines.append("✅ This trade is perfectly fair!")
@@ -615,18 +643,31 @@ class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
 
             lines.append(f"⚖️ **{heavier_side.capitalize()}** side is worth **{target}** more.")
 
-            subset, subset_diff = find_best_removal_subset(heavier_items, target)
-            if subset:
-                subset_names = ", ".join(f"{n} ({v})" for n, v in subset)
-                subset_value = sum(v for _, v in subset)
-                lines.append(
-                    f"\n💡 To balance it out, consider removing **{subset_names}** "
-                    f"(worth {subset_value}) from the {heavier_side} side."
-                )
-                if round(subset_diff, 2) != 0:
-                    lines.append(f"(This would leave a small remaining gap of about {round(subset_diff, 2)}.)")
+            options = find_best_removal_subsets(heavier_items, target, max_options=3)
+            if options:
+                if len(options) == 1:
+                    lines.append(f"\n💡 To balance it out, consider removing:")
+                else:
+                    lines.append(f"\n💡 A few ways to balance it out — remove:")
+
+                for i, (subset, subset_diff) in enumerate(options, start=1):
+                    subset_names = ", ".join(f"{n} ({v})" for n, v, _ in subset)
+                    subset_value = sum(v for _, v, _ in subset)
+                    gap_note = ""
+                    if round(subset_diff, 2) != 0:
+                        gap_note = f" *(leaves a small gap of ~{round(subset_diff, 2)})*"
+
+                    prefix = f"**Option {i}:**" if len(options) > 1 else "•"
+                    lines.append(f"{prefix} **{subset_names}** (worth {subset_value}) from the {heavier_side} side{gap_note}")
             else:
-                lines.append(f"\n💡 Consider adding roughly **{target}** worth of items to the lighter side instead.")
+                removable_count = len([i for i in heavier_items if not i[2]])
+                if removable_count == 0:
+                    lines.append(
+                        f"\n💡 All items on the {heavier_side} side are marked as priority, "
+                        f"so consider adding roughly **{target}** worth of items to the lighter side instead."
+                    )
+                else:
+                    lines.append(f"\n💡 Consider adding roughly **{target}** worth of items to the lighter side instead.")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 

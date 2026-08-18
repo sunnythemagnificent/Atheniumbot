@@ -3,6 +3,7 @@ from discord import app_commands
 from discord.ext import commands
 import asyncio
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -514,22 +515,36 @@ async def opencomms(interaction: discord.Interaction):
 
 def parse_items(text):
     """
-    Parse 'Item Name:Value, Item Name:Value' into a list of (name, value, is_priority) tuples.
-    Prefix an item name with * to mark it as a must-keep priority item, e.g. '*Liquid Glass Filter:4'
+    Parse item lines into a list of (name, avg_value, is_priority, display) tuples.
+    Accepts two formats:
+      - 'Item Name:Value'        e.g. 'Liquid Glass Filter:4'
+      - 'Item Name - Value Caps' e.g. 'Liquid Glass Filter - 4 Caps'
+    Both formats support:
+      - Ranges, e.g. 'Item:1-2' or 'Item - 1-2 Caps' — the midpoint is used for math,
+        the original range is kept for display.
+      - A '*' prefix on the name to mark it as a must-keep priority item.
     """
     items = []
     errors = []
     if not text or not text.strip():
         return items, errors
 
-    for chunk in text.split(","):
+    for chunk in re.split(r"[,\n]+", text):
         chunk = chunk.strip()
         if not chunk:
             continue
-        if ":" not in chunk:
+
+        name = None
+        value_str = None
+
+        if ":" in chunk:
+            name, _, value_str = chunk.rpartition(":")
+        elif " - " in chunk:
+            name, _, value_str = chunk.rpartition(" - ")
+        else:
             errors.append(chunk)
             continue
-        name, _, value_str = chunk.rpartition(":")
+
         name = name.strip()
         value_str = value_str.strip()
 
@@ -537,11 +552,20 @@ def parse_items(text):
         if is_priority:
             name = name[1:].strip()
 
-        try:
-            value = float(value_str)
-            items.append((name, value, is_priority))
-        except ValueError:
+        # Pull out the numeric value or range, ignoring trailing words like "Caps"/"Cap"
+        match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?", value_str)
+        if not name or not match:
             errors.append(chunk)
+            continue
+
+        low = float(match.group(1))
+        high = float(match.group(2)) if match.group(2) else low
+        if low > high:
+            low, high = high, low
+        avg_value = (low + high) / 2
+        display = f"{low:g}" if low == high else f"{low:g}-{high:g}"
+
+        items.append((name, avg_value, is_priority, display))
 
     return items, errors
 
@@ -563,7 +587,7 @@ def find_best_removal_subsets(items, target_diff, max_options=3):
     n = len(removable_items)
     for mask in range(1, 1 << n):
         subset = [removable_items[i] for i in range(n) if mask & (1 << i)]
-        subset_value = sum(v for _, v, _ in subset)
+        subset_value = sum(v for _, v, _, _ in subset)
         diff_from_target = abs(subset_value - target_diff)
         all_subsets.append((subset, diff_from_target))
 
@@ -574,7 +598,7 @@ def find_best_removal_subsets(items, target_diff, max_options=3):
     seen_signatures = set()
     unique_options = []
     for subset, diff_from_target in all_subsets:
-        signature = frozenset(n for n, _, _ in subset)
+        signature = frozenset(n for n, _, _, _ in subset)
         if signature in seen_signatures:
             continue
         seen_signatures.add(signature)
@@ -586,20 +610,20 @@ def find_best_removal_subsets(items, target_diff, max_options=3):
 
 
 def format_items(items):
-    return ", ".join(f"⭐{n} ({v})" if p else f"{n} ({v})" for n, v, p in items)
+    return ", ".join(f"⭐{n} ({d})" if p else f"{n} ({d})" for n, v, p, d in items)
 
 
 class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
     your_items = discord.ui.TextInput(
-        label="Your items (Name:Value, *Priority:Value)",
+        label="Your items",
         style=discord.TextStyle.paragraph,
-        placeholder="Liquid Glass Filter:4, *Subtle Blush:2",
+        placeholder="Liquid Glass Filter:4\n*Subtle Blush - 1-2 Caps",
         required=True,
     )
     their_items = discord.ui.TextInput(
-        label="Their items (Name:Value, *Priority:Value)",
+        label="Their items",
         style=discord.TextStyle.paragraph,
-        placeholder="Pfish Trinket:3, Oversized Witch Hat:5",
+        placeholder="Pfish Trinket - 3 Caps\nOversized Witch Hat:2-3",
         required=True,
     )
 
@@ -610,7 +634,7 @@ class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
         if your_errors or their_errors:
             bad = your_errors + their_errors
             await interaction.response.send_message(
-                f"⚠️ Couldn't parse these entries (make sure it's `Name:Value`): {', '.join(bad)}",
+                f"⚠️ Couldn't parse these entries (use `Name:Value` or `Name - Value Caps`): {', '.join(bad)}",
                 ephemeral=True
             )
             return
@@ -622,26 +646,31 @@ class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
             )
             return
 
-        your_total = sum(v for _, v, _ in your_list)
-        their_total = sum(v for _, v, _ in their_list)
+        your_total = sum(v for _, v, _, _ in your_list)
+        their_total = sum(v for _, v, _, _ in their_list)
         diff = round(your_total - their_total, 2)
 
         lines = [
-            f"**Your side:** {format_items(your_list)} — Total: **{your_total}**",
-            f"**Their side:** {format_items(their_list)} — Total: **{their_total}**",
+            f"**Your side:** {format_items(your_list)} — Total: **{your_total:g}**",
+            f"**Their side:** {format_items(their_list)} — Total: **{their_total:g}**",
             "",
         ]
-        if any(p for _, _, p in your_list) or any(p for _, _, p in their_list):
-            lines.append("⭐ = marked as a must-keep priority item (won't be suggested for removal)\n")
+        if any(p for _, _, p, _ in your_list) or any(p for _, _, p, _ in their_list):
+            lines.append("⭐ = marked as a must-keep priority item (won't be suggested for removal)")
+        if any("-" in d for _, _, _, d in your_list) or any("-" in d for _, _, _, d in their_list):
+            lines.append("*(Ranged items use their midpoint value for calculations)*")
+        if lines[-1] != "":
+            lines.append("")
 
         if diff == 0:
             lines.append("✅ This trade is perfectly fair!")
         else:
-            heavier_side = "yours" if diff > 0 else "theirs"
+            # "your"/"their" as possessive determiners for correct grammar
+            heavier_owner = "your" if diff > 0 else "their"
             heavier_items = your_list if diff > 0 else their_list
             target = abs(diff)
 
-            lines.append(f"⚖️ **{heavier_side.capitalize()}** side is worth **{target}** more.")
+            lines.append(f"⚖️ **{heavier_owner.capitalize()}** side is worth **{target:g}** more.")
 
             options = find_best_removal_subsets(heavier_items, target, max_options=3)
             if options:
@@ -651,30 +680,53 @@ class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
                     lines.append(f"\n💡 A few ways to balance it out — remove:")
 
                 for i, (subset, subset_diff) in enumerate(options, start=1):
-                    subset_names = ", ".join(f"{n} ({v})" for n, v, _ in subset)
-                    subset_value = sum(v for _, v, _ in subset)
+                    subset_names = ", ".join(f"{n} ({d})" for n, v, _, d in subset)
+                    subset_value = sum(v for _, v, _, _ in subset)
                     gap_note = ""
                     if round(subset_diff, 2) != 0:
-                        gap_note = f" *(leaves a small gap of ~{round(subset_diff, 2)})*"
+                        gap_note = f" *(leaves a small gap of ~{round(subset_diff, 2):g})*"
 
                     prefix = f"**Option {i}:**" if len(options) > 1 else "•"
-                    lines.append(f"{prefix} **{subset_names}** (worth {subset_value}) from the {heavier_side} side{gap_note}")
+                    lines.append(f"{prefix} **{subset_names}** (worth {subset_value:g}) from {heavier_owner} side{gap_note}")
             else:
                 removable_count = len([i for i in heavier_items if not i[2]])
                 if removable_count == 0:
                     lines.append(
-                        f"\n💡 All items on the {heavier_side} side are marked as priority, "
-                        f"so consider adding roughly **{target}** worth of items to the lighter side instead."
+                        f"\n💡 All items on {heavier_owner} side are marked as priority, "
+                        f"so consider adding roughly **{target:g}** worth of items to the lighter side instead."
                     )
                 else:
-                    lines.append(f"\n💡 Consider adding roughly **{target}** worth of items to the lighter side instead.")
+                    lines.append(f"\n💡 Consider adding roughly **{target:g}** worth of items to the lighter side instead.")
 
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
+class FairTradeStartView(discord.ui.View):
+    """Shown before the modal so we have room for full instructions (modal labels cap at 45 characters)."""
+
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="Open Trade Form", style=discord.ButtonStyle.primary, emoji="📝")
+    async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(FairTradeModal())
+
+
 @bot.tree.command(name="fairtrade", description="Check if a Neocash trade is fair and get suggestions to balance it")
 async def fairtrade(interaction: discord.Interaction):
-    await interaction.response.send_modal(FairTradeModal())
+    instructions = (
+        "🎨 **Fair Trade Calculator**\n\n"
+        "List each item on its own **line**, or separated by **commas**. Both work!\n\n"
+        "**Accepted formats:**\n"
+        "• `Item Name:Value` — e.g. `Liquid Glass Filter:4`\n"
+        "• `Item Name - Value Caps` — e.g. `Liquid Glass Filter - 4 Caps`\n\n"
+        "**Value can be a range too:**\n"
+        "• `Subtle Blush:1-2` or `Subtle Blush - 1-2 Caps` *(the midpoint is used for the math)*\n\n"
+        "**Priority items:** put a `*` before the name to mark it as a must-keep —\n"
+        "`*Rare Item:5` — it will never be suggested for removal.\n\n"
+        "Click below when you're ready to fill out your items!"
+    )
+    await interaction.response.send_message(instructions, view=FairTradeStartView(), ephemeral=True)
 
 
 # ============================================================

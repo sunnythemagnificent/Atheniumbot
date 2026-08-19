@@ -7,6 +7,7 @@ import re
 import sqlite3
 import aiohttp
 import html
+import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -38,8 +39,12 @@ GIVEAWAY_PING_ROLE = "Giveaways"           # Role to ping when a new giveaway is
 # Food Club settings
 FOOD_CLUB_CHANNEL = "🥕︱food-club"          # Channel name without #
 FOOD_CLUB_PING_ROLE = "Food Club Betters"  # Role to ping on High/Very High outlook days
-FOOD_CLUB_REDDIT_USER = "nsheng"           # Reddit user who posts the daily bets
-FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's post isn't up yet
+FOOD_CLUB_REDDIT_USER = "nsheng"           # Reddit user who comments the daily outlook
+FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's thread/comment isn't up yet
+
+# Badges settings
+BADGE_MOD_ROLES = ["moderator", "admin", "coordinator"]   # Role names allowed to create/award/remove badges — edit to match your server
+BADGES_DIR = os.environ.get("BADGES_DIR", "/data/badges")  # Where badge image files are stored (on the Volume)
 
 # Where the persistent database lives — this should point inside your Railway Volume
 DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
@@ -55,8 +60,9 @@ def get_db():
 
 
 def init_db():
-    # Make sure the folder exists (in case the volume isn't mounted yet)
+    # Make sure the folders exist (in case the volume isn't mounted yet)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    os.makedirs(BADGES_DIR, exist_ok=True)
     conn = get_db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS art_trade_pool (
@@ -82,6 +88,24 @@ def init_db():
             date TEXT PRIMARY KEY,
             outlook TEXT,
             pinged INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS badges (
+            badge_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            filename TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_badges (
+            user_id INTEGER NOT NULL,
+            badge_id INTEGER NOT NULL,
+            awarded_by INTEGER,
+            awarded_at TEXT,
+            PRIMARY KEY (user_id, badge_id)
         )
     """)
     conn.commit()
@@ -182,6 +206,66 @@ def db_set_food_club_status(date_str, outlook, pinged):
     """, (date_str, outlook, int(pinged)))
     conn.commit()
     conn.close()
+
+
+# --- Badges helpers ---
+
+def db_create_badge(name, filename, created_by):
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO badges (name, filename, created_by, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (name, filename, created_by, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def db_get_badge_by_name(name):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM badges WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
+    conn.close()
+    if row:
+        return {"badge_id": row["badge_id"], "name": row["name"], "filename": row["filename"]}
+    return None
+
+
+def db_list_all_badges():
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM badges ORDER BY name").fetchall()
+    conn.close()
+    return [{"badge_id": r["badge_id"], "name": r["name"], "filename": r["filename"]} for r in rows]
+
+
+def db_award_badge(user_id, badge_id, awarded_by):
+    conn = get_db()
+    conn.execute("""
+        INSERT OR IGNORE INTO user_badges (user_id, badge_id, awarded_by, awarded_at)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, badge_id, awarded_by, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    changed = conn.total_changes
+    conn.close()
+    return changed > 0
+
+
+def db_remove_badge_from_user(user_id, badge_id):
+    conn = get_db()
+    conn.execute("DELETE FROM user_badges WHERE user_id = ? AND badge_id = ?", (user_id, badge_id))
+    conn.commit()
+    conn.close()
+
+
+def db_get_user_badges(user_id):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT b.badge_id, b.name, b.filename
+        FROM user_badges ub
+        JOIN badges b ON ub.badge_id = b.badge_id
+        WHERE ub.user_id = ?
+        ORDER BY ub.awarded_at
+    """, (user_id,)).fetchall()
+    conn.close()
+    return [{"badge_id": r["badge_id"], "name": r["name"], "filename": r["filename"]} for r in rows]
 
 
 # ============================================================
@@ -466,6 +550,139 @@ async def cancel(interaction: discord.Interaction):
         await interaction.response.send_message("You've been removed from the art trade pool.", ephemeral=True)
     else:
         await interaction.response.send_message("You don't have an active art trade request.", ephemeral=True)
+
+
+# ============================================================
+#  BADGES
+# ============================================================
+
+def is_badge_mod(member: discord.Member) -> bool:
+    return any(r.name in BADGE_MOD_ROLES for r in member.roles)
+
+
+async def badge_name_autocomplete(interaction: discord.Interaction, current: str):
+    all_badges = db_list_all_badges()
+    matches = [b for b in all_badges if current.lower() in b["name"].lower()]
+    return [app_commands.Choice(name=b["name"], value=b["name"]) for b in matches[:25]]
+
+
+@bot.tree.command(name="createbadge", description="[Mod] Create a new badge that can be awarded to members")
+@app_commands.describe(name="The badge's name", image="The badge icon (PNG recommended)")
+async def createbadge(interaction: discord.Interaction, name: str, image: discord.Attachment):
+    if not is_badge_mod(interaction.user):
+        await interaction.response.send_message("⚠️ You don't have permission to create badges.", ephemeral=True)
+        return
+
+    if db_get_badge_by_name(name):
+        await interaction.response.send_message(f"⚠️ A badge named **{name}** already exists.", ephemeral=True)
+        return
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        await interaction.response.send_message("⚠️ Please attach an image file.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    ext = os.path.splitext(image.filename)[1] or ".png"
+    safe_filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(BADGES_DIR, safe_filename)
+
+    try:
+        await image.save(filepath)
+    except Exception as e:
+        await interaction.followup.send(f"⚠️ Couldn't save the image: {e}", ephemeral=True)
+        return
+
+    db_create_badge(name, safe_filename, interaction.user.id)
+    await interaction.followup.send(f"✅ Badge **{name}** created! Use `/awardbadge` to give it out.", ephemeral=True)
+    print(f"🏅 {interaction.user.display_name} created badge '{name}'")
+
+
+@bot.tree.command(name="awardbadge", description="[Mod] Award a badge to a member")
+@app_commands.describe(user="Who to award the badge to", badge="The badge to award")
+@app_commands.autocomplete(badge=badge_name_autocomplete)
+async def awardbadge(interaction: discord.Interaction, user: discord.Member, badge: str):
+    if not is_badge_mod(interaction.user):
+        await interaction.response.send_message("⚠️ You don't have permission to award badges.", ephemeral=True)
+        return
+
+    badge_data = db_get_badge_by_name(badge)
+    if not badge_data:
+        await interaction.response.send_message(f"⚠️ No badge named **{badge}** exists. Use `/createbadge` first.", ephemeral=True)
+        return
+
+    awarded = db_award_badge(user.id, badge_data["badge_id"], interaction.user.id)
+    if awarded:
+        await interaction.response.send_message(f"✅ Awarded **{badge_data['name']}** to {user.mention}!")
+        print(f"🏅 {interaction.user.display_name} awarded '{badge_data['name']}' to {user.display_name}")
+    else:
+        await interaction.response.send_message(f"⚠️ {user.mention} already has the **{badge_data['name']}** badge.", ephemeral=True)
+
+
+@bot.tree.command(name="removebadge", description="[Mod] Remove a badge from a member")
+@app_commands.describe(user="Who to remove the badge from", badge="The badge to remove")
+@app_commands.autocomplete(badge=badge_name_autocomplete)
+async def removebadge(interaction: discord.Interaction, user: discord.Member, badge: str):
+    if not is_badge_mod(interaction.user):
+        await interaction.response.send_message("⚠️ You don't have permission to remove badges.", ephemeral=True)
+        return
+
+    badge_data = db_get_badge_by_name(badge)
+    if not badge_data:
+        await interaction.response.send_message(f"⚠️ No badge named **{badge}** exists.", ephemeral=True)
+        return
+
+    db_remove_badge_from_user(user.id, badge_data["badge_id"])
+    await interaction.response.send_message(f"✅ Removed **{badge_data['name']}** from {user.mention}.", ephemeral=True)
+    print(f"🏅 {interaction.user.display_name} removed '{badge_data['name']}' from {user.display_name}")
+
+
+@bot.tree.command(name="badges", description="View a member's badge collection")
+@app_commands.describe(user="Whose badges to view (defaults to yourself)")
+async def badges(interaction: discord.Interaction, user: discord.Member = None):
+    target = user or interaction.user
+    earned = db_get_user_badges(target.id)
+
+    if not earned:
+        who = "You don't" if target.id == interaction.user.id else f"{target.display_name} doesn't"
+        await interaction.response.send_message(f"{who} have any badges yet!", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    # Discord groups multiple embeds' images into a gallery grid when they
+    # share the same non-empty `url` — this gives us a grid display without
+    # needing to composite the images ourselves.
+    gallery_url = "https://athenaeum.badges/display"
+
+    files = []
+    embeds = []
+    badge_names = ", ".join(b["name"] for b in earned)
+
+    header_embed = discord.Embed(
+        title=f"🏅 {target.display_name}'s Badges",
+        description=badge_names,
+        color=discord.Color.gold(),
+    )
+    embeds.append(header_embed)
+
+    # Discord allows a max of 10 embeds per message
+    for i, b in enumerate(earned[:10]):
+        filepath = os.path.join(BADGES_DIR, b["filename"])
+        if not os.path.exists(filepath):
+            continue
+
+        attachment_name = f"badge_{i}_{b['filename']}"
+        files.append(discord.File(filepath, filename=attachment_name))
+
+        embed = discord.Embed(url=gallery_url, color=discord.Color.gold())
+        embed.set_image(url=f"attachment://{attachment_name}")
+        embeds.append(embed)
+
+    if len(earned) > 10:
+        embeds[0].set_footer(text=f"Showing 10 of {len(earned)} badges")
+
+    await interaction.followup.send(embeds=embeds, files=files)
 
 
 # ============================================================
@@ -1153,13 +1370,17 @@ async def food_club_check_loop():
                 is_high = "high" in outlook_text.lower()
                 pinged = False
 
+                # Strip any trailing period/exclamation from nsheng's text so our
+                # own "!" doesn't collide with his punctuation (e.g. "Return.!")
+                outlook_display = outlook_text.rstrip(" .!")
+
                 if is_high:
                     for guild in bot.guilds:
                         channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
                         role = discord.utils.get(guild.roles, name=FOOD_CLUB_PING_ROLE)
                         if channel and role:
                             try:
-                                message_lines = [f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_text}**!"]
+                                message_lines = [f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_display}**!"]
 
                                 if bets:
                                     message_lines.append("")

@@ -1,1 +1,2 @@
-discord.py==2.4.0
+py-cord==2.6.1
+Pillow==10.4.0

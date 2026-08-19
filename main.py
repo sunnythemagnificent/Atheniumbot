@@ -1022,24 +1022,42 @@ def parse_food_club_bets(content_html):
     return bets
 
 
-async def fetch_rss(url):
-    """Fetch and parse an Atom/RSS feed. Returns the parsed XML root, or None on failure."""
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=REDDIT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    print(f"⚠️ Food Club: RSS returned status {resp.status} for {url}")
-                    return None
-                text = await resp.text()
-    except Exception as e:
-        print(f"⚠️ Food Club: couldn't reach {url} — {e}")
-        return None
+async def fetch_rss(url, retries=2, backoff_seconds=8):
+    """
+    Fetch and parse an Atom/RSS feed. Returns the parsed XML root, or None on failure.
+    Retries on 429 (rate limited) with a short backoff, and falls back to
+    old.reddit.com if www.reddit.com is being blocked.
+    """
+    urls_to_try = [url]
+    if "www.reddit.com" in url:
+        urls_to_try.append(url.replace("www.reddit.com", "old.reddit.com"))
 
-    try:
-        return ET.fromstring(text)
-    except ET.ParseError as e:
-        print(f"⚠️ Food Club: couldn't parse RSS feed — {e}")
-        return None
+    for attempt_url in urls_to_try:
+        for attempt in range(retries + 1):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        attempt_url, headers=REDDIT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
+                    ) as resp:
+                        if resp.status == 200:
+                            text = await resp.text()
+                            try:
+                                return ET.fromstring(text)
+                            except ET.ParseError as e:
+                                print(f"⚠️ Food Club: couldn't parse RSS feed — {e}")
+                                return None
+                        elif resp.status == 429:
+                            print(f"⚠️ Food Club: rate limited (429) on {attempt_url}, attempt {attempt + 1}/{retries + 1}")
+                            if attempt < retries:
+                                await asyncio.sleep(backoff_seconds)
+                        else:
+                            print(f"⚠️ Food Club: RSS returned status {resp.status} for {attempt_url}")
+                            break  # non-429 error, no point retrying this URL
+            except Exception as e:
+                print(f"⚠️ Food Club: couldn't reach {attempt_url} — {e}")
+                break
+
+    return None
 
 
 async def find_todays_food_club_thread():
@@ -1085,6 +1103,8 @@ async def fetch_food_club_outlook():
     thread_url = await find_todays_food_club_thread()
     if not thread_url:
         return None, None, None
+
+    await asyncio.sleep(3)  # brief pause between requests to be gentle on Reddit's rate limits
 
     comments_rss_url = thread_url if thread_url.endswith("/") else thread_url + "/"
     comments_rss_url += ".rss"

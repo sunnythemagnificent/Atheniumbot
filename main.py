@@ -268,6 +268,25 @@ def db_get_user_badges(user_id):
     return [{"badge_id": r["badge_id"], "name": r["name"], "filename": r["filename"]} for r in rows]
 
 
+def db_count_badge_holders(badge_id):
+    conn = get_db()
+    row = conn.execute("SELECT COUNT(*) as cnt FROM user_badges WHERE badge_id = ?", (badge_id,)).fetchone()
+    conn.close()
+    return row["cnt"]
+
+
+def db_delete_badge(badge_id):
+    """Deletes a badge entirely — removes it from every member who has it too. Returns the filename."""
+    conn = get_db()
+    row = conn.execute("SELECT filename FROM badges WHERE badge_id = ?", (badge_id,)).fetchone()
+    filename = row["filename"] if row else None
+    conn.execute("DELETE FROM user_badges WHERE badge_id = ?", (badge_id,))
+    conn.execute("DELETE FROM badges WHERE badge_id = ?", (badge_id,))
+    conn.commit()
+    conn.close()
+    return filename
+
+
 # ============================================================
 #  BOT SETUP
 # ============================================================
@@ -638,6 +657,67 @@ async def removebadge(interaction: discord.Interaction, user: discord.Member, ba
     db_remove_badge_from_user(user.id, badge_data["badge_id"])
     await interaction.response.send_message(f"✅ Removed **{badge_data['name']}** from {user.mention}.", ephemeral=True)
     print(f"🏅 {interaction.user.display_name} removed '{badge_data['name']}' from {user.display_name}")
+
+
+class ConfirmDeleteBadgeView(discord.ui.View):
+    """Confirmation buttons before permanently deleting a badge."""
+
+    def __init__(self, badge_id, badge_name, filename, requester_id):
+        super().__init__(timeout=60)
+        self.badge_id = badge_id
+        self.badge_name = badge_name
+        self.filename = filename
+        self.requester_id = requester_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.requester_id:
+            await interaction.response.send_message("Only the person who ran this command can confirm it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        db_delete_badge(self.badge_id)
+
+        filepath = os.path.join(BADGES_DIR, self.filename)
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception as e:
+            print(f"⚠️ Couldn't delete badge image file: {e}")
+
+        await interaction.response.edit_message(
+            content=f"🗑️ Badge **{self.badge_name}** has been permanently deleted and removed from everyone who had it.",
+            view=None
+        )
+        print(f"🏅 {interaction.user.display_name} deleted badge '{self.badge_name}'")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled — the badge was not deleted.", view=None)
+
+
+@bot.tree.command(name="deletebadge", description="[Mod] Permanently delete a badge and remove it from everyone who has it")
+@app_commands.describe(badge="The badge to delete")
+@app_commands.autocomplete(badge=badge_name_autocomplete)
+async def deletebadge(interaction: discord.Interaction, badge: str):
+    if not is_badge_mod(interaction.user):
+        await interaction.response.send_message("⚠️ You don't have permission to delete badges.", ephemeral=True)
+        return
+
+    badge_data = db_get_badge_by_name(badge)
+    if not badge_data:
+        await interaction.response.send_message(f"⚠️ No badge named **{badge}** exists.", ephemeral=True)
+        return
+
+    holder_count = db_count_badge_holders(badge_data["badge_id"])
+    warning = f" **{holder_count} member(s)** currently have this badge — it will be removed from all of them." if holder_count else " No one currently has this badge."
+
+    await interaction.response.send_message(
+        f"⚠️ Are you sure you want to permanently delete **{badge_data['name']}**?{warning}\nThis cannot be undone.",
+        view=ConfirmDeleteBadgeView(badge_data["badge_id"], badge_data["name"], badge_data["filename"], interaction.user.id),
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="badges", description="View a member's badge collection")

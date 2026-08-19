@@ -8,6 +8,7 @@ import sqlite3
 import aiohttp
 import html
 import uuid
+from PIL import Image
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -575,6 +576,26 @@ async def cancel(interaction: discord.Interaction):
 #  BADGES
 # ============================================================
 
+def pad_image_to_square(filepath):
+    """
+    Pads an image out to a square canvas with a transparent background,
+    centering the original artwork. Prevents Discord's gallery-grid display
+    from cropping tall/wide badge images. Overwrites the file in place.
+    """
+    img = Image.open(filepath).convert("RGBA")
+    width, height = img.size
+
+    if width == height:
+        img.save(filepath, "PNG")
+        return
+
+    size = max(width, height)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    offset = ((size - width) // 2, (size - height) // 2)
+    canvas.paste(img, offset, img)
+    canvas.save(filepath, "PNG")
+
+
 def is_badge_mod(member: discord.Member) -> bool:
     member_role_names = [r.name for r in member.roles]
     result = any(r.name in BADGE_MOD_ROLES for r in member.roles)
@@ -605,12 +626,12 @@ async def createbadge(interaction: discord.Interaction, name: str, image: discor
 
     await interaction.response.defer(ephemeral=True)
 
-    ext = os.path.splitext(image.filename)[1] or ".png"
-    safe_filename = f"{uuid.uuid4().hex}{ext}"
+    safe_filename = f"{uuid.uuid4().hex}.png"
     filepath = os.path.join(BADGES_DIR, safe_filename)
 
     try:
         await image.save(filepath)
+        pad_image_to_square(filepath)
     except Exception as e:
         await interaction.followup.send(f"⚠️ Couldn't save the image: {e}", ephemeral=True)
         return

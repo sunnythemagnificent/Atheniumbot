@@ -8,6 +8,7 @@ import sqlite3
 import aiohttp
 import html
 import uuid
+import io
 from PIL import Image
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
@@ -741,6 +742,79 @@ async def deletebadge(interaction: discord.Interaction, badge: str):
     )
 
 
+@bot.tree.command(name="fixbadgeimages", description="[Mod] Re-pad all existing badge images to square so none are cropped")
+async def fixbadgeimages(interaction: discord.Interaction):
+    if not is_badge_mod(interaction.user):
+        await interaction.response.send_message("⚠️ You don't have permission to do this.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    all_badges = db_list_all_badges()
+    fixed = 0
+    skipped = 0
+
+    for b in all_badges:
+        filepath = os.path.join(BADGES_DIR, b["filename"])
+        if not os.path.exists(filepath):
+            skipped += 1
+            continue
+        try:
+            pad_image_to_square(filepath)
+            fixed += 1
+        except Exception as e:
+            print(f"⚠️ Couldn't re-pad badge '{b['name']}': {e}")
+            skipped += 1
+
+    await interaction.followup.send(
+        f"✅ Re-padded {fixed} badge image(s) to square.{f' ({skipped} skipped due to errors)' if skipped else ''}",
+        ephemeral=True
+    )
+    print(f"🏅 {interaction.user.display_name} ran fixbadgeimages — fixed {fixed}, skipped {skipped}")
+
+
+def build_badge_grid_image(badge_filepaths, cell_size=150, gap=12, max_columns=4):
+    """
+    Composites badge icons into a single grid image we fully control,
+    avoiding any cropping from Discord's own gallery layout logic.
+    Each badge is resized to fit within a square cell (preserving aspect
+    ratio, letterboxed with transparency) regardless of its stored shape.
+    """
+    count = len(badge_filepaths)
+    columns = min(max_columns, count)
+    rows = (count + columns - 1) // columns
+
+    grid_width = columns * cell_size + (columns + 1) * gap
+    grid_height = rows * cell_size + (rows + 1) * gap
+
+    grid = Image.new("RGBA", (grid_width, grid_height), (0, 0, 0, 0))
+
+    for i, filepath in enumerate(badge_filepaths):
+        try:
+            img = Image.open(filepath).convert("RGBA")
+        except Exception:
+            continue
+
+        # Fit within the cell while preserving aspect ratio
+        img.thumbnail((cell_size, cell_size), Image.LANCZOS)
+
+        col = i % columns
+        row = i // columns
+        cell_x = gap + col * (cell_size + gap)
+        cell_y = gap + row * (cell_size + gap)
+
+        # Center the (possibly non-square) thumbnail within its square cell
+        offset_x = cell_x + (cell_size - img.width) // 2
+        offset_y = cell_y + (cell_size - img.height) // 2
+
+        grid.paste(img, (offset_x, offset_y), img)
+
+    buffer = io.BytesIO()
+    grid.save(buffer, "PNG")
+    buffer.seek(0)
+    return buffer
+
+
 @bot.tree.command(name="badges", description="View a member's badge collection")
 @app_commands.describe(user="Whose badges to view (defaults to yourself)")
 async def badges(interaction: discord.Interaction, user: discord.Member = None):
@@ -754,39 +828,25 @@ async def badges(interaction: discord.Interaction, user: discord.Member = None):
 
     await interaction.response.defer()
 
-    # Discord groups multiple embeds' images into a gallery grid when they
-    # share the same non-empty `url` — this gives us a grid display without
-    # needing to composite the images ourselves.
-    gallery_url = "https://athenaeum.badges/display"
-
-    files = []
-    embeds = []
     badge_names = ", ".join(b["name"] for b in earned)
+    filepaths = [os.path.join(BADGES_DIR, b["filename"]) for b in earned]
+    filepaths = [fp for fp in filepaths if os.path.exists(fp)]
 
-    header_embed = discord.Embed(
+    if not filepaths:
+        await interaction.followup.send(f"🏅 **{target.display_name}'s Badges**\n{badge_names}\n\n*(Badge images couldn't be found)*")
+        return
+
+    buffer = build_badge_grid_image(filepaths)
+    file = discord.File(buffer, filename="badges.png")
+
+    embed = discord.Embed(
         title=f"🏅 {target.display_name}'s Badges",
         description=badge_names,
         color=discord.Color.gold(),
     )
-    embeds.append(header_embed)
+    embed.set_image(url="attachment://badges.png")
 
-    # Discord allows a max of 10 embeds per message
-    for i, b in enumerate(earned[:10]):
-        filepath = os.path.join(BADGES_DIR, b["filename"])
-        if not os.path.exists(filepath):
-            continue
-
-        attachment_name = f"badge_{i}_{b['filename']}"
-        files.append(discord.File(filepath, filename=attachment_name))
-
-        embed = discord.Embed(url=gallery_url, color=discord.Color.gold())
-        embed.set_image(url=f"attachment://{attachment_name}")
-        embeds.append(embed)
-
-    if len(earned) > 10:
-        embeds[0].set_footer(text=f"Showing 10 of {len(earned)} badges")
-
-    await interaction.followup.send(embeds=embeds, files=files)
+    await interaction.followup.send(embed=embed, file=file)
 
 
 # ============================================================
@@ -1333,8 +1393,8 @@ REDDIT_HEADERS = {
 def parse_food_club_bets(content_html):
     """Extract NFC bet links for each betting level from a comment's rendered HTML content."""
     pattern = re.compile(
-        r'(Beginner|Standard|Aggressive|Adventurous):\s*<a[^>]+href="(https://neofood\.club/[^"]+)"',
-        re.IGNORECASE
+        r'(Beginner|Standard|Aggressive|Adventurous):.{0,50}?<a[^>]+href="(https://neofood\.club/[^"]+)"',
+        re.IGNORECASE | re.DOTALL
     )
     bets = {}
     for m in pattern.finditer(content_html):
@@ -1450,6 +1510,11 @@ async def fetch_food_club_outlook():
 
         outlook_text = html.unescape(match.group(1).strip())
         bets = parse_food_club_bets(content_html)
+
+        # Debug logging — helps us see the real structure of nsheng's comment
+        # so we can refine bet-link extraction if it's not matching
+        print(f"🔍 Food Club debug — raw content_html (first 2500 chars):\n{content_html[:2500]}")
+        print(f"🔍 Food Club debug — bets found: {bets}")
 
         link_el = entry.find(f"{ATOM_NS}link")
         comment_url = link_el.get("href") if link_el is not None else thread_url

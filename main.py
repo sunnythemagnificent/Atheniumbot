@@ -5,6 +5,9 @@ import asyncio
 import os
 import re
 import sqlite3
+import aiohttp
+import html
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
 # ============================================================
@@ -31,6 +34,12 @@ GIVEAWAY_CHANNEL = "🎁︱giveaways"          # Channel name without #
 GIVEAWAY_BOT_ROLE = "GiveawayBot"          # Role name of the giveaway bot — must match exactly
 GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
 GIVEAWAY_PING_ROLE = "Giveaways"           # Role to ping when a new giveaway is detected
+
+# Food Club settings
+FOOD_CLUB_CHANNEL = "🥕︱food-club"          # Channel name without #
+FOOD_CLUB_PING_ROLE = "Food Club Betters"  # Role to ping on High/Very High outlook days
+FOOD_CLUB_REDDIT_USER = "nsheng"           # Reddit user who posts the daily bets
+FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's post isn't up yet
 
 # Where the persistent database lives — this should point inside your Railway Volume
 DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
@@ -66,6 +75,13 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             slots INTEGER,
             where_link TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS food_club_status (
+            date TEXT PRIMARY KEY,
+            outlook TEXT,
+            pinged INTEGER
         )
     """)
     conn.commit()
@@ -145,6 +161,27 @@ def db_load_all_commissions():
     rows = conn.execute("SELECT * FROM commissions").fetchall()
     conn.close()
     return [{"user_id": row["user_id"], "slots": row["slots"], "where": row["where_link"]} for row in rows]
+
+
+# --- Food Club helpers ---
+
+def db_get_food_club_status(date_str):
+    conn = get_db()
+    row = conn.execute("SELECT * FROM food_club_status WHERE date = ?", (date_str,)).fetchone()
+    conn.close()
+    if row:
+        return {"date": row["date"], "outlook": row["outlook"], "pinged": bool(row["pinged"])}
+    return None
+
+
+def db_set_food_club_status(date_str, outlook, pinged):
+    conn = get_db()
+    conn.execute("""
+        INSERT OR REPLACE INTO food_club_status (date, outlook, pinged)
+        VALUES (?, ?, ?)
+    """, (date_str, outlook, int(pinged)))
+    conn.commit()
+    conn.close()
 
 
 # ============================================================
@@ -869,6 +906,7 @@ async def on_ready():
 
     bot.loop.create_task(check_expirations())
     bot.loop.create_task(startup_activity_check())
+    bot.loop.create_task(food_club_check_loop())
 
 
 @bot.event
@@ -955,6 +993,145 @@ async def check_expirations():
                         print(f"⏰ Removed '{ACTIVE_ROLE_NAME}' from {member.display_name} (inactive 30 days)")
 
         await asyncio.sleep(3600)  # Check every hour
+
+
+# ============================================================
+#  FOOD CLUB OUTLOOK CHECKER
+# ============================================================
+
+ATOM_NS = "{http://www.w3.org/2005/Atom}"
+
+
+def parse_food_club_bets(content_html):
+    """Extract NFC bet links for each betting level from the post's rendered HTML content."""
+    pattern = re.compile(
+        r'(Beginner|Standard|Aggressive|Adventurous):\s*<a[^>]+href="(https://neofood\.club/[^"]+)"',
+        re.IGNORECASE
+    )
+    bets = {}
+    for m in pattern.finditer(content_html):
+        level = m.group(1).capitalize()
+        bets[level] = html.unescape(m.group(2))
+    return bets
+
+
+async def fetch_food_club_outlook():
+    """
+    Check u/nsheng's recent Reddit submissions (via public RSS feed — no API key needed)
+    for today's Food Club Bets post. Returns (outlook_text, post_url, bets_dict) if found,
+    or (None, None, None) if not posted yet or something went wrong.
+    """
+    candidate_urls = [
+        f"https://www.reddit.com/user/{FOOD_CLUB_REDDIT_USER}/submitted/.rss",
+        f"https://www.reddit.com/user/{FOOD_CLUB_REDDIT_USER}/submitted.rss",
+    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        )
+    }
+
+    text = None
+    for url in candidate_urls:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status == 200:
+                        text = await resp.text()
+                        break
+                    else:
+                        print(f"⚠️ Food Club: RSS returned status {resp.status} for {url}")
+        except Exception as e:
+            print(f"⚠️ Food Club: couldn't reach Reddit RSS ({url}) — {e}")
+
+    if text is None:
+        return None, None, None
+
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        print(f"⚠️ Food Club: couldn't parse RSS feed — {e}")
+        return None, None, None
+
+    now = datetime.now(timezone.utc)
+    today_labels = {now.strftime("%B %-d, %Y").lower(), now.strftime("%B %d, %Y").lower()}
+
+    for entry in root.findall(f"{ATOM_NS}entry"):
+        title_el = entry.find(f"{ATOM_NS}title")
+        title = (title_el.text or "") if title_el is not None else ""
+        title_lower = title.lower()
+
+        if "food club bets" not in title_lower:
+            continue
+        if not any(label in title_lower for label in today_labels):
+            continue
+
+        content_el = entry.find(f"{ATOM_NS}content")
+        content_html = (content_el.text or "") if content_el is not None else ""
+
+        link_el = entry.find(f"{ATOM_NS}link")
+        post_url = link_el.get("href") if link_el is not None else None
+
+        match = re.search(r"outlook for this round:\s*([^<\n]+)", content_html, re.IGNORECASE)
+        if not match:
+            print(f"🥕 Food Club: found today's post but couldn't locate the Outlook line")
+            continue
+
+        outlook_text = html.unescape(match.group(1).strip())
+        bets = parse_food_club_bets(content_html)
+
+        return outlook_text, post_url, bets
+
+    return None, None, None
+
+
+async def food_club_check_loop():
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        existing = db_get_food_club_status(today_str)
+
+        if existing is None:
+            outlook_text, post_url, bets = await fetch_food_club_outlook()
+
+            if outlook_text:
+                is_high = "high" in outlook_text.lower()
+                pinged = False
+
+                if is_high:
+                    for guild in bot.guilds:
+                        channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
+                        role = discord.utils.get(guild.roles, name=FOOD_CLUB_PING_ROLE)
+                        if channel and role:
+                            try:
+                                message_lines = [f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_text}**!"]
+
+                                if bets:
+                                    message_lines.append("")
+                                    level_order = ["Beginner", "Standard", "Aggressive", "Adventurous"]
+                                    for level in level_order:
+                                        if level in bets:
+                                            message_lines.append(f"**{level}:** [NFC link]({bets[level]})")
+
+                                if post_url:
+                                    message_lines.append("")
+                                    message_lines.append(post_url)
+
+                                await channel.send("\n".join(message_lines))
+                                pinged = True
+                                print(f"🥕 Pinged {FOOD_CLUB_PING_ROLE} — outlook: {outlook_text}")
+                            except Exception as e:
+                                print(f"⚠️ Food Club: couldn't send ping — {e}")
+
+                db_set_food_club_status(today_str, outlook_text, pinged)
+                if not is_high:
+                    print(f"🥕 Food Club outlook today: '{outlook_text}' — no ping needed")
+            else:
+                print(f"🥕 Food Club: no post found for {today_str} yet, will check again in {FOOD_CLUB_CHECK_INTERVAL_HOURS}h")
+
+        await asyncio.sleep(FOOD_CLUB_CHECK_INTERVAL_HOURS * 3600)
 
 
 # ============================================================

@@ -1001,9 +1001,16 @@ async def check_expirations():
 
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
+REDDIT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    )
+}
+
 
 def parse_food_club_bets(content_html):
-    """Extract NFC bet links for each betting level from the post's rendered HTML content."""
+    """Extract NFC bet links for each betting level from a comment's rendered HTML content."""
     pattern = re.compile(
         r'(Beginner|Standard|Aggressive|Adventurous):\s*<a[^>]+href="(https://neofood\.club/[^"]+)"',
         re.IGNORECASE
@@ -1015,44 +1022,38 @@ def parse_food_club_bets(content_html):
     return bets
 
 
-async def fetch_food_club_outlook():
-    """
-    Check u/nsheng's recent Reddit submissions (via public RSS feed — no API key needed)
-    for today's Food Club Bets post. Returns (outlook_text, post_url, bets_dict) if found,
-    or (None, None, None) if not posted yet or something went wrong.
-    """
-    candidate_urls = [
-        f"https://www.reddit.com/user/{FOOD_CLUB_REDDIT_USER}/submitted/.rss",
-        f"https://www.reddit.com/user/{FOOD_CLUB_REDDIT_USER}/submitted.rss",
-    ]
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-        )
-    }
-
-    text = None
-    for url in candidate_urls:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                    if resp.status == 200:
-                        text = await resp.text()
-                        break
-                    else:
-                        print(f"⚠️ Food Club: RSS returned status {resp.status} for {url}")
-        except Exception as e:
-            print(f"⚠️ Food Club: couldn't reach Reddit RSS ({url}) — {e}")
-
-    if text is None:
-        return None, None, None
+async def fetch_rss(url):
+    """Fetch and parse an Atom/RSS feed. Returns the parsed XML root, or None on failure."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=REDDIT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status != 200:
+                    print(f"⚠️ Food Club: RSS returned status {resp.status} for {url}")
+                    return None
+                text = await resp.text()
+    except Exception as e:
+        print(f"⚠️ Food Club: couldn't reach {url} — {e}")
+        return None
 
     try:
-        root = ET.fromstring(text)
+        return ET.fromstring(text)
     except ET.ParseError as e:
         print(f"⚠️ Food Club: couldn't parse RSS feed — {e}")
-        return None, None, None
+        return None
+
+
+async def find_todays_food_club_thread():
+    """
+    Search r/neopets for today's AutoModerator 'Food Club Bets' thread.
+    Returns the thread's URL, or None if it hasn't been posted yet.
+    """
+    from urllib.parse import quote
+    query = quote('title:"Food Club Bets"')
+    search_url = f"https://www.reddit.com/r/neopets/search.rss?q={query}&restrict_sr=on&sort=new&limit=5"
+
+    root = await fetch_rss(search_url)
+    if root is None:
+        return None
 
     now = datetime.now(timezone.utc)
     today_labels = {now.strftime("%B %-d, %Y").lower(), now.strftime("%B %d, %Y").lower()}
@@ -1067,22 +1068,54 @@ async def fetch_food_club_outlook():
         if not any(label in title_lower for label in today_labels):
             continue
 
+        link_el = entry.find(f"{ATOM_NS}link")
+        if link_el is not None:
+            return link_el.get("href")
+
+    return None
+
+
+async def fetch_food_club_outlook():
+    """
+    Find today's AutoModerator Food Club Bets thread, then look for u/nsheng's
+    comment inside it containing the outlook and NFC bet links.
+    Returns (outlook_text, comment_url, bets_dict) if found, or (None, None, None)
+    if the thread or comment isn't up yet, or something went wrong.
+    """
+    thread_url = await find_todays_food_club_thread()
+    if not thread_url:
+        return None, None, None
+
+    comments_rss_url = thread_url if thread_url.endswith("/") else thread_url + "/"
+    comments_rss_url += ".rss"
+
+    root = await fetch_rss(comments_rss_url)
+    if root is None:
+        return None, None, None
+
+    for entry in root.findall(f"{ATOM_NS}entry"):
+        author_el = entry.find(f"{ATOM_NS}author/{ATOM_NS}name")
+        author = (author_el.text or "") if author_el is not None else ""
+
+        if FOOD_CLUB_REDDIT_USER.lower() not in author.lower():
+            continue
+
         content_el = entry.find(f"{ATOM_NS}content")
         content_html = (content_el.text or "") if content_el is not None else ""
 
-        link_el = entry.find(f"{ATOM_NS}link")
-        post_url = link_el.get("href") if link_el is not None else None
-
         match = re.search(r"outlook for this round:\s*([^<\n]+)", content_html, re.IGNORECASE)
         if not match:
-            print(f"🥕 Food Club: found today's post but couldn't locate the Outlook line")
             continue
 
         outlook_text = html.unescape(match.group(1).strip())
         bets = parse_food_club_bets(content_html)
 
-        return outlook_text, post_url, bets
+        link_el = entry.find(f"{ATOM_NS}link")
+        comment_url = link_el.get("href") if link_el is not None else thread_url
 
+        return outlook_text, comment_url, bets
+
+    print(f"🥕 Food Club: found today's thread but no matching comment from u/{FOOD_CLUB_REDDIT_USER} yet")
     return None, None, None
 
 

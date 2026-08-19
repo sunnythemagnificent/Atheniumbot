@@ -43,7 +43,7 @@ FOOD_CLUB_REDDIT_USER = "nsheng"           # Reddit user who comments the daily 
 FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's thread/comment isn't up yet
 
 # Badges settings
-BADGE_MOD_ROLES = ["moderator", "admin", "coordinator"]   # Role names allowed to create/award/remove badges — edit to match your server
+BADGE_MOD_ROLES = ["Moderator", "Admin", "Coordinator"]   # Role names allowed to create/award/remove badges — edit to match your server
 BADGES_DIR = os.environ.get("BADGES_DIR", "/data/badges")  # Where badge image files are stored (on the Volume)
 
 # Where the persistent database lives — this should point inside your Railway Volume
@@ -557,7 +557,10 @@ async def cancel(interaction: discord.Interaction):
 # ============================================================
 
 def is_badge_mod(member: discord.Member) -> bool:
-    return any(r.name in BADGE_MOD_ROLES for r in member.roles)
+    member_role_names = [r.name for r in member.roles]
+    result = any(r.name in BADGE_MOD_ROLES for r in member.roles)
+    print(f"🔍 Badge permission check for {member.display_name}: roles={member_role_names}, allowed={BADGE_MOD_ROLES}, result={result}")
+    return result
 
 
 async def badge_name_autocomplete(interaction: discord.Interaction, current: str):

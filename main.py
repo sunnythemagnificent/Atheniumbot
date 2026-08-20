@@ -7,9 +7,6 @@ import re
 import sqlite3
 import aiohttp
 import html
-import uuid
-import io
-from PIL import Image
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 
@@ -43,10 +40,7 @@ FOOD_CLUB_CHANNEL = "🥕︱food-club"          # Channel name without #
 FOOD_CLUB_PING_ROLE = "Food Club Betters"  # Role to ping on High/Very High outlook days
 FOOD_CLUB_REDDIT_USER = "nsheng"           # Reddit user who comments the daily outlook
 FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's thread/comment isn't up yet
-
-# Badges settings
-BADGE_MOD_ROLES = ["Moderator", "Admin", "Coordinator"]   # Role names allowed to create/award/remove badges — edit to match your server
-BADGES_DIR = os.environ.get("BADGES_DIR", "/data/badges")  # Where badge image files are stored (on the Volume)
+FOOD_CLUB_ENABLE_PING = False               # Set to True to ping the role again — currently just posts silently in-channel
 
 # Where the persistent database lives — this should point inside your Railway Volume
 DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
@@ -64,7 +58,6 @@ def get_db():
 def init_db():
     # Make sure the folders exist (in case the volume isn't mounted yet)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    os.makedirs(BADGES_DIR, exist_ok=True)
     conn = get_db()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS art_trade_pool (
@@ -90,24 +83,6 @@ def init_db():
             date TEXT PRIMARY KEY,
             outlook TEXT,
             pinged INTEGER
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS badges (
-            badge_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            filename TEXT NOT NULL,
-            created_by INTEGER,
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS user_badges (
-            user_id INTEGER NOT NULL,
-            badge_id INTEGER NOT NULL,
-            awarded_by INTEGER,
-            awarded_at TEXT,
-            PRIMARY KEY (user_id, badge_id)
         )
     """)
     conn.commit()
@@ -208,85 +183,6 @@ def db_set_food_club_status(date_str, outlook, pinged):
     """, (date_str, outlook, int(pinged)))
     conn.commit()
     conn.close()
-
-
-# --- Badges helpers ---
-
-def db_create_badge(name, filename, created_by):
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO badges (name, filename, created_by, created_at)
-        VALUES (?, ?, ?, ?)
-    """, (name, filename, created_by, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
-
-
-def db_get_badge_by_name(name):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM badges WHERE name = ? COLLATE NOCASE", (name,)).fetchone()
-    conn.close()
-    if row:
-        return {"badge_id": row["badge_id"], "name": row["name"], "filename": row["filename"]}
-    return None
-
-
-def db_list_all_badges():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM badges ORDER BY name").fetchall()
-    conn.close()
-    return [{"badge_id": r["badge_id"], "name": r["name"], "filename": r["filename"]} for r in rows]
-
-
-def db_award_badge(user_id, badge_id, awarded_by):
-    conn = get_db()
-    conn.execute("""
-        INSERT OR IGNORE INTO user_badges (user_id, badge_id, awarded_by, awarded_at)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, badge_id, awarded_by, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    changed = conn.total_changes
-    conn.close()
-    return changed > 0
-
-
-def db_remove_badge_from_user(user_id, badge_id):
-    conn = get_db()
-    conn.execute("DELETE FROM user_badges WHERE user_id = ? AND badge_id = ?", (user_id, badge_id))
-    conn.commit()
-    conn.close()
-
-
-def db_get_user_badges(user_id):
-    conn = get_db()
-    rows = conn.execute("""
-        SELECT b.badge_id, b.name, b.filename
-        FROM user_badges ub
-        JOIN badges b ON ub.badge_id = b.badge_id
-        WHERE ub.user_id = ?
-        ORDER BY ub.awarded_at
-    """, (user_id,)).fetchall()
-    conn.close()
-    return [{"badge_id": r["badge_id"], "name": r["name"], "filename": r["filename"]} for r in rows]
-
-
-def db_count_badge_holders(badge_id):
-    conn = get_db()
-    row = conn.execute("SELECT COUNT(*) as cnt FROM user_badges WHERE badge_id = ?", (badge_id,)).fetchone()
-    conn.close()
-    return row["cnt"]
-
-
-def db_delete_badge(badge_id):
-    """Deletes a badge entirely — removes it from every member who has it too. Returns the filename."""
-    conn = get_db()
-    row = conn.execute("SELECT filename FROM badges WHERE badge_id = ?", (badge_id,)).fetchone()
-    filename = row["filename"] if row else None
-    conn.execute("DELETE FROM user_badges WHERE badge_id = ?", (badge_id,))
-    conn.execute("DELETE FROM badges WHERE badge_id = ?", (badge_id,))
-    conn.commit()
-    conn.close()
-    return filename
 
 
 # ============================================================
@@ -573,280 +469,6 @@ async def cancel(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have an active art trade request.", ephemeral=True)
 
 
-# ============================================================
-#  BADGES
-# ============================================================
-
-def pad_image_to_square(filepath):
-    """
-    Pads an image out to a square canvas with a transparent background,
-    centering the original artwork. Prevents Discord's gallery-grid display
-    from cropping tall/wide badge images. Overwrites the file in place.
-    """
-    img = Image.open(filepath).convert("RGBA")
-    width, height = img.size
-
-    if width == height:
-        img.save(filepath, "PNG")
-        return
-
-    size = max(width, height)
-    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    offset = ((size - width) // 2, (size - height) // 2)
-    canvas.paste(img, offset, img)
-    canvas.save(filepath, "PNG")
-
-
-def is_badge_mod(member: discord.Member) -> bool:
-    member_role_names = [r.name for r in member.roles]
-    result = any(r.name in BADGE_MOD_ROLES for r in member.roles)
-    print(f"🔍 Badge permission check for {member.display_name}: roles={member_role_names}, allowed={BADGE_MOD_ROLES}, result={result}")
-    return result
-
-
-async def badge_name_autocomplete(interaction: discord.Interaction, current: str):
-    all_badges = db_list_all_badges()
-    matches = [b for b in all_badges if current.lower() in b["name"].lower()]
-    return [app_commands.Choice(name=b["name"], value=b["name"]) for b in matches[:25]]
-
-
-@bot.tree.command(name="createbadge", description="[Mod] Create a new badge that can be awarded to members")
-@app_commands.describe(name="The badge's name", image="The badge icon (PNG recommended)")
-async def createbadge(interaction: discord.Interaction, name: str, image: discord.Attachment):
-    if not is_badge_mod(interaction.user):
-        await interaction.response.send_message("⚠️ You don't have permission to create badges.", ephemeral=True)
-        return
-
-    if db_get_badge_by_name(name):
-        await interaction.response.send_message(f"⚠️ A badge named **{name}** already exists.", ephemeral=True)
-        return
-
-    if not image.content_type or not image.content_type.startswith("image/"):
-        await interaction.response.send_message("⚠️ Please attach an image file.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    safe_filename = f"{uuid.uuid4().hex}.png"
-    filepath = os.path.join(BADGES_DIR, safe_filename)
-
-    try:
-        await image.save(filepath)
-        pad_image_to_square(filepath)
-    except Exception as e:
-        await interaction.followup.send(f"⚠️ Couldn't save the image: {e}", ephemeral=True)
-        return
-
-    db_create_badge(name, safe_filename, interaction.user.id)
-    await interaction.followup.send(f"✅ Badge **{name}** created! Use `/awardbadge` to give it out.", ephemeral=True)
-    print(f"🏅 {interaction.user.display_name} created badge '{name}'")
-
-
-@bot.tree.command(name="awardbadge", description="[Mod] Award a badge to a member")
-@app_commands.describe(user="Who to award the badge to", badge="The badge to award")
-@app_commands.autocomplete(badge=badge_name_autocomplete)
-async def awardbadge(interaction: discord.Interaction, user: discord.Member, badge: str):
-    if not is_badge_mod(interaction.user):
-        await interaction.response.send_message("⚠️ You don't have permission to award badges.", ephemeral=True)
-        return
-
-    badge_data = db_get_badge_by_name(badge)
-    if not badge_data:
-        await interaction.response.send_message(f"⚠️ No badge named **{badge}** exists. Use `/createbadge` first.", ephemeral=True)
-        return
-
-    awarded = db_award_badge(user.id, badge_data["badge_id"], interaction.user.id)
-    if awarded:
-        await interaction.response.send_message(f"✅ Awarded **{badge_data['name']}** to {user.mention}!")
-        print(f"🏅 {interaction.user.display_name} awarded '{badge_data['name']}' to {user.display_name}")
-    else:
-        await interaction.response.send_message(f"⚠️ {user.mention} already has the **{badge_data['name']}** badge.", ephemeral=True)
-
-
-@bot.tree.command(name="removebadge", description="[Mod] Remove a badge from a member")
-@app_commands.describe(user="Who to remove the badge from", badge="The badge to remove")
-@app_commands.autocomplete(badge=badge_name_autocomplete)
-async def removebadge(interaction: discord.Interaction, user: discord.Member, badge: str):
-    if not is_badge_mod(interaction.user):
-        await interaction.response.send_message("⚠️ You don't have permission to remove badges.", ephemeral=True)
-        return
-
-    badge_data = db_get_badge_by_name(badge)
-    if not badge_data:
-        await interaction.response.send_message(f"⚠️ No badge named **{badge}** exists.", ephemeral=True)
-        return
-
-    db_remove_badge_from_user(user.id, badge_data["badge_id"])
-    await interaction.response.send_message(f"✅ Removed **{badge_data['name']}** from {user.mention}.", ephemeral=True)
-    print(f"🏅 {interaction.user.display_name} removed '{badge_data['name']}' from {user.display_name}")
-
-
-class ConfirmDeleteBadgeView(discord.ui.View):
-    """Confirmation buttons before permanently deleting a badge."""
-
-    def __init__(self, badge_id, badge_name, filename, requester_id):
-        super().__init__(timeout=60)
-        self.badge_id = badge_id
-        self.badge_name = badge_name
-        self.filename = filename
-        self.requester_id = requester_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.requester_id:
-            await interaction.response.send_message("Only the person who ran this command can confirm it.", ephemeral=True)
-            return False
-        return True
-
-    @discord.ui.button(label="Yes, delete it", style=discord.ButtonStyle.danger, emoji="🗑️")
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        db_delete_badge(self.badge_id)
-
-        filepath = os.path.join(BADGES_DIR, self.filename)
-        try:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-        except Exception as e:
-            print(f"⚠️ Couldn't delete badge image file: {e}")
-
-        await interaction.response.edit_message(
-            content=f"🗑️ Badge **{self.badge_name}** has been permanently deleted and removed from everyone who had it.",
-            view=None
-        )
-        print(f"🏅 {interaction.user.display_name} deleted badge '{self.badge_name}'")
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="Cancelled — the badge was not deleted.", view=None)
-
-
-@bot.tree.command(name="deletebadge", description="[Mod] Permanently delete a badge and remove it from everyone who has it")
-@app_commands.describe(badge="The badge to delete")
-@app_commands.autocomplete(badge=badge_name_autocomplete)
-async def deletebadge(interaction: discord.Interaction, badge: str):
-    if not is_badge_mod(interaction.user):
-        await interaction.response.send_message("⚠️ You don't have permission to delete badges.", ephemeral=True)
-        return
-
-    badge_data = db_get_badge_by_name(badge)
-    if not badge_data:
-        await interaction.response.send_message(f"⚠️ No badge named **{badge}** exists.", ephemeral=True)
-        return
-
-    holder_count = db_count_badge_holders(badge_data["badge_id"])
-    warning = f" **{holder_count} member(s)** currently have this badge — it will be removed from all of them." if holder_count else " No one currently has this badge."
-
-    await interaction.response.send_message(
-        f"⚠️ Are you sure you want to permanently delete **{badge_data['name']}**?{warning}\nThis cannot be undone.",
-        view=ConfirmDeleteBadgeView(badge_data["badge_id"], badge_data["name"], badge_data["filename"], interaction.user.id),
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="fixbadgeimages", description="[Mod] Re-pad all existing badge images to square so none are cropped")
-async def fixbadgeimages(interaction: discord.Interaction):
-    if not is_badge_mod(interaction.user):
-        await interaction.response.send_message("⚠️ You don't have permission to do this.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    all_badges = db_list_all_badges()
-    fixed = 0
-    skipped = 0
-
-    for b in all_badges:
-        filepath = os.path.join(BADGES_DIR, b["filename"])
-        if not os.path.exists(filepath):
-            skipped += 1
-            continue
-        try:
-            pad_image_to_square(filepath)
-            fixed += 1
-        except Exception as e:
-            print(f"⚠️ Couldn't re-pad badge '{b['name']}': {e}")
-            skipped += 1
-
-    await interaction.followup.send(
-        f"✅ Re-padded {fixed} badge image(s) to square.{f' ({skipped} skipped due to errors)' if skipped else ''}",
-        ephemeral=True
-    )
-    print(f"🏅 {interaction.user.display_name} ran fixbadgeimages — fixed {fixed}, skipped {skipped}")
-
-
-def build_badge_grid_image(badge_filepaths, cell_size=150, gap=12, max_columns=4):
-    """
-    Composites badge icons into a single grid image we fully control,
-    avoiding any cropping from Discord's own gallery layout logic.
-    Each badge is resized to fit within a square cell (preserving aspect
-    ratio, letterboxed with transparency) regardless of its stored shape.
-    """
-    count = len(badge_filepaths)
-    columns = min(max_columns, count)
-    rows = (count + columns - 1) // columns
-
-    grid_width = columns * cell_size + (columns + 1) * gap
-    grid_height = rows * cell_size + (rows + 1) * gap
-
-    grid = Image.new("RGBA", (grid_width, grid_height), (0, 0, 0, 0))
-
-    for i, filepath in enumerate(badge_filepaths):
-        try:
-            img = Image.open(filepath).convert("RGBA")
-        except Exception:
-            continue
-
-        # Fit within the cell while preserving aspect ratio
-        img.thumbnail((cell_size, cell_size), Image.LANCZOS)
-
-        col = i % columns
-        row = i // columns
-        cell_x = gap + col * (cell_size + gap)
-        cell_y = gap + row * (cell_size + gap)
-
-        # Center the (possibly non-square) thumbnail within its square cell
-        offset_x = cell_x + (cell_size - img.width) // 2
-        offset_y = cell_y + (cell_size - img.height) // 2
-
-        grid.paste(img, (offset_x, offset_y), img)
-
-    buffer = io.BytesIO()
-    grid.save(buffer, "PNG")
-    buffer.seek(0)
-    return buffer
-
-
-@bot.tree.command(name="badges", description="View a member's badge collection")
-@app_commands.describe(user="Whose badges to view (defaults to yourself)")
-async def badges(interaction: discord.Interaction, user: discord.Member = None):
-    target = user or interaction.user
-    earned = db_get_user_badges(target.id)
-
-    if not earned:
-        who = "You don't" if target.id == interaction.user.id else f"{target.display_name} doesn't"
-        await interaction.response.send_message(f"{who} have any badges yet!", ephemeral=True)
-        return
-
-    await interaction.response.defer()
-
-    badge_names = ", ".join(b["name"] for b in earned)
-    filepaths = [os.path.join(BADGES_DIR, b["filename"]) for b in earned]
-    filepaths = [fp for fp in filepaths if os.path.exists(fp)]
-
-    if not filepaths:
-        await interaction.followup.send(f"🏅 **{target.display_name}'s Badges**\n{badge_names}\n\n*(Badge images couldn't be found)*")
-        return
-
-    buffer = build_badge_grid_image(filepaths)
-    file = discord.File(buffer, filename="badges.png")
-
-    embed = discord.Embed(
-        title=f"🏅 {target.display_name}'s Badges",
-        description=badge_names,
-        color=discord.Color.gold(),
-    )
-    embed.set_image(url="attachment://badges.png")
-
-    await interaction.followup.send(embed=embed, file=file)
 
 
 # ============================================================
@@ -1547,9 +1169,13 @@ async def food_club_check_loop():
                     for guild in bot.guilds:
                         channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
                         role = discord.utils.get(guild.roles, name=FOOD_CLUB_PING_ROLE)
-                        if channel and role:
+                        if channel and (role or not FOOD_CLUB_ENABLE_PING):
                             try:
-                                message_lines = [f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_display}**!"]
+                                if FOOD_CLUB_ENABLE_PING and role:
+                                    header = f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_display}**!"
+                                else:
+                                    header = f"🥕 Today's Food Club outlook: **{outlook_display}**!"
+                                message_lines = [header]
 
                                 if bets:
                                     message_lines.append("")
@@ -1564,7 +1190,10 @@ async def food_club_check_loop():
 
                                 await channel.send("\n".join(message_lines))
                                 pinged = True
-                                print(f"🥕 Pinged {FOOD_CLUB_PING_ROLE} — outlook: {outlook_text}")
+                                if FOOD_CLUB_ENABLE_PING and role:
+                                    print(f"🥕 Pinged {FOOD_CLUB_PING_ROLE} — outlook: {outlook_text}")
+                                else:
+                                    print(f"🥕 Posted (no ping) — outlook: {outlook_text}")
                             except Exception as e:
                                 print(f"⚠️ Food Club: couldn't send ping — {e}")
 

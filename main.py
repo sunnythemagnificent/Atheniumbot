@@ -42,6 +42,8 @@ FOOD_CLUB_REDDIT_USER = "nsheng"           # Reddit user who comments the daily 
 FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's thread/comment isn't up yet
 FOOD_CLUB_ENABLE_PING = False               # Set to True to ping the role again — currently just posts silently in-channel
 
+BOT_MOD_ROLES = ["Moderator", "Admin", "Coordinator"]   # Role names allowed to use admin commands like /foodclubreset
+
 # Where the persistent database lives — this should point inside your Railway Volume
 DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
 
@@ -181,6 +183,13 @@ def db_set_food_club_status(date_str, outlook, pinged):
         INSERT OR REPLACE INTO food_club_status (date, outlook, pinged)
         VALUES (?, ?, ?)
     """, (date_str, outlook, int(pinged)))
+    conn.commit()
+    conn.close()
+
+
+def db_delete_food_club_status(date_str):
+    conn = get_db()
+    conn.execute("DELETE FROM food_club_status WHERE date = ?", (date_str,))
     conn.commit()
     conn.close()
 
@@ -1153,69 +1162,92 @@ async def fetch_food_club_outlook():
     return None, None, None, False
 
 
+async def run_food_club_check():
+    """
+    Runs a single Food Club check cycle: fetch, decide skip/low/high, post if
+    appropriate. Returns a short summary string describing what happened.
+    Used by both the background loop and the /foodclubreset command.
+    """
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    existing = db_get_food_club_status(today_str)
+
+    if existing is not None:
+        msg = f"Already checked {today_str} (outlook was: '{existing['outlook']}')"
+        print(f"🥕 Food Club: {msg} — waiting until tomorrow")
+        return msg
+
+    outlook_text, post_url, bets, is_skip_day = await fetch_food_club_outlook()
+
+    if is_skip_day:
+        print(f"🥕 Food Club: nsheng mentioned all sets skipping today — skipping post entirely")
+        db_set_food_club_status(today_str, "Skip day — all sets skipping", False)
+        return "Skip day detected (nsheng mentioned all sets skipping) — nothing posted"
+
+    elif outlook_text:
+        is_high = "high" in outlook_text.lower()
+        is_low = "low" in outlook_text.lower()
+        should_ping = is_high and FOOD_CLUB_ENABLE_PING
+        pinged = False
+
+        # Strip any trailing period/exclamation from nsheng's text so our
+        # own "!" doesn't collide with his punctuation (e.g. "Return.!")
+        outlook_display = outlook_text.rstrip(" .!")
+
+        if is_low:
+            print(f"🥕 Food Club outlook today: '{outlook_text}' — Low/Very Low, skipping post entirely")
+            db_set_food_club_status(today_str, outlook_text, False)
+            return f"Low/Very Low outlook ('{outlook_text}') — nothing posted"
+        else:
+            posted_anywhere = False
+            for guild in bot.guilds:
+                channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
+                role = discord.utils.get(guild.roles, name=FOOD_CLUB_PING_ROLE) if should_ping else None
+                if channel:
+                    try:
+                        if should_ping and role:
+                            header = f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_display}**!"
+                        else:
+                            header = f"🥕 Today's Food Club outlook: **{outlook_display}**"
+                        message_lines = [header]
+
+                        if bets:
+                            message_lines.append("")
+                            level_order = ["Beginner", "Standard", "Aggressive", "Adventurous"]
+                            for level in level_order:
+                                if level in bets:
+                                    message_lines.append(f"**{level}:** [NFC link]({bets[level]})")
+
+                        if post_url:
+                            message_lines.append("")
+                            message_lines.append(post_url)
+
+                        await channel.send("\n".join(message_lines))
+                        posted_anywhere = True
+
+                        if should_ping and role:
+                            pinged = True
+                            print(f"🥕 Pinged {FOOD_CLUB_PING_ROLE} — outlook: {outlook_text}")
+                        else:
+                            print(f"🥕 Posted (no ping) — outlook: {outlook_text}")
+                    except Exception as e:
+                        print(f"⚠️ Food Club: couldn't send message — {e}")
+
+            db_set_food_club_status(today_str, outlook_text, pinged)
+            if posted_anywhere:
+                return f"Posted! Outlook: '{outlook_text}'" + (" (pinged)" if pinged else " (no ping)")
+            else:
+                return f"Found outlook ('{outlook_text}') but couldn't find the channel to post in"
+    else:
+        msg = f"No post found for {today_str} yet"
+        print(f"🥕 Food Club: {msg}, will check again in {FOOD_CLUB_CHECK_INTERVAL_HOURS}h")
+        return msg
+
+
 async def food_club_check_loop():
     await bot.wait_until_ready()
 
     while not bot.is_closed():
-        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        existing = db_get_food_club_status(today_str)
-
-        if existing is None:
-            outlook_text, post_url, bets, is_skip_day = await fetch_food_club_outlook()
-
-            if is_skip_day:
-                print(f"🥕 Food Club: nsheng mentioned all sets skipping today — skipping post entirely")
-                db_set_food_club_status(today_str, "Skip day — all sets skipping", False)
-            elif outlook_text:
-                is_high = "high" in outlook_text.lower()
-                is_low = "low" in outlook_text.lower()
-                should_ping = is_high and FOOD_CLUB_ENABLE_PING
-                pinged = False
-
-                # Strip any trailing period/exclamation from nsheng's text so our
-                # own "!" doesn't collide with his punctuation (e.g. "Return.!")
-                outlook_display = outlook_text.rstrip(" .!")
-
-                if is_low:
-                    print(f"🥕 Food Club outlook today: '{outlook_text}' — Low/Very Low, skipping post entirely")
-                    db_set_food_club_status(today_str, outlook_text, False)
-                else:
-                    for guild in bot.guilds:
-                        channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
-                        role = discord.utils.get(guild.roles, name=FOOD_CLUB_PING_ROLE) if should_ping else None
-                        if channel:
-                            try:
-                                if should_ping and role:
-                                    header = f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_display}**!"
-                                else:
-                                    header = f"🥕 Today's Food Club outlook: **{outlook_display}**"
-                                message_lines = [header]
-
-                                if bets:
-                                    message_lines.append("")
-                                    level_order = ["Beginner", "Standard", "Aggressive", "Adventurous"]
-                                    for level in level_order:
-                                        if level in bets:
-                                            message_lines.append(f"**{level}:** [NFC link]({bets[level]})")
-
-                                if post_url:
-                                    message_lines.append("")
-                                    message_lines.append(post_url)
-
-                                await channel.send("\n".join(message_lines))
-
-                                if should_ping and role:
-                                    pinged = True
-                                    print(f"🥕 Pinged {FOOD_CLUB_PING_ROLE} — outlook: {outlook_text}")
-                                else:
-                                    print(f"🥕 Posted (no ping) — outlook: {outlook_text}")
-                            except Exception as e:
-                                print(f"⚠️ Food Club: couldn't send message — {e}")
-
-                    db_set_food_club_status(today_str, outlook_text, pinged)
-            else:
-                print(f"🥕 Food Club: no post found for {today_str} yet, will check again in {FOOD_CLUB_CHECK_INTERVAL_HOURS}h")
-
+        await run_food_club_check()
         await asyncio.sleep(FOOD_CLUB_CHECK_INTERVAL_HOURS * 3600)
 
 

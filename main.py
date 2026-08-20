@@ -1182,8 +1182,14 @@ async def run_food_club_check():
         return "Skip day detected (nsheng mentioned all sets skipping) — nothing posted"
 
     elif outlook_text:
-        is_high = "high" in outlook_text.lower()
-        is_low = "low" in outlook_text.lower()
+        # Extract just the "___ Expected Return" descriptor (e.g. "Very High", "Moderate",
+        # "Low") so a Risk level of Low/High doesn't get mistaken for the Return level.
+        # e.g. "Low Risk, Moderate Expected Return." -> return_descriptor = "Moderate"
+        return_match = re.search(r"([A-Za-z\s]+?)\s*Expected Return", outlook_text, re.IGNORECASE)
+        return_descriptor = return_match.group(1).strip() if return_match else outlook_text
+
+        is_high = "high" in return_descriptor.lower()
+        is_low = "low" in return_descriptor.lower()
         should_ping = is_high and FOOD_CLUB_ENABLE_PING
         pinged = False
 

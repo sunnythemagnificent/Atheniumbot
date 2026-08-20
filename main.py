@@ -1100,12 +1100,13 @@ async def fetch_food_club_outlook():
     """
     Find today's AutoModerator Food Club Bets thread, then look for u/nsheng's
     comment inside it containing the outlook and NFC bet links.
-    Returns (outlook_text, comment_url, bets_dict) if found, or (None, None, None)
-    if the thread or comment isn't up yet, or something went wrong.
+    Returns (outlook_text, comment_url, bets_dict, is_skip_day) if found, or
+    (None, None, None, False) if the thread or comment isn't up yet, or
+    something went wrong.
     """
     thread_url = await find_todays_food_club_thread()
     if not thread_url:
-        return None, None, None
+        return None, None, None, False
 
     await asyncio.sleep(3)  # brief pause between requests to be gentle on Reddit's rate limits
 
@@ -1114,7 +1115,7 @@ async def fetch_food_club_outlook():
 
     root = await fetch_rss(comments_rss_url)
     if root is None:
-        return None, None, None
+        return None, None, None, False
 
     for entry in root.findall(f"{ATOM_NS}entry"):
         author_el = entry.find(f"{ATOM_NS}author/{ATOM_NS}name")
@@ -1126,25 +1127,30 @@ async def fetch_food_club_outlook():
         content_el = entry.find(f"{ATOM_NS}content")
         content_html = (content_el.text or "") if content_el is not None else ""
 
+        # Check for a "skipping this round" mention anywhere in the comment —
+        # strip HTML tags first so a phrase split across tags still matches
+        plain_text = re.sub(r"<[^>]+>", " ", content_html)
+        is_skip_day = bool(re.search(r"sets?\W+(?:are\W+)?skipping", plain_text, re.IGNORECASE))
+
         match = re.search(r"outlook for this round:\s*([^<\n]+)", content_html, re.IGNORECASE)
-        if not match:
+        if not match and not is_skip_day:
             continue
 
-        outlook_text = html.unescape(match.group(1).strip())
+        outlook_text = html.unescape(match.group(1).strip()) if match else None
         bets = parse_food_club_bets(content_html)
 
         # Debug logging — helps us see the real structure of nsheng's comment
         # so we can refine bet-link extraction if it's not matching
         print(f"🔍 Food Club debug — raw content_html (first 2500 chars):\n{content_html[:2500]}")
-        print(f"🔍 Food Club debug — bets found: {bets}")
+        print(f"🔍 Food Club debug — bets found: {bets}, is_skip_day: {is_skip_day}")
 
         link_el = entry.find(f"{ATOM_NS}link")
         comment_url = link_el.get("href") if link_el is not None else thread_url
 
-        return outlook_text, comment_url, bets
+        return outlook_text, comment_url, bets, is_skip_day
 
     print(f"🥕 Food Club: found today's thread but no matching comment from u/{FOOD_CLUB_REDDIT_USER} yet")
-    return None, None, None
+    return None, None, None, False
 
 
 async def food_club_check_loop():
@@ -1155,26 +1161,34 @@ async def food_club_check_loop():
         existing = db_get_food_club_status(today_str)
 
         if existing is None:
-            outlook_text, post_url, bets = await fetch_food_club_outlook()
+            outlook_text, post_url, bets, is_skip_day = await fetch_food_club_outlook()
 
-            if outlook_text:
+            if is_skip_day:
+                print(f"🥕 Food Club: nsheng mentioned all sets skipping today — skipping post entirely")
+                db_set_food_club_status(today_str, "Skip day — all sets skipping", False)
+            elif outlook_text:
                 is_high = "high" in outlook_text.lower()
+                is_low = "low" in outlook_text.lower()
+                should_ping = is_high and FOOD_CLUB_ENABLE_PING
                 pinged = False
 
                 # Strip any trailing period/exclamation from nsheng's text so our
                 # own "!" doesn't collide with his punctuation (e.g. "Return.!")
                 outlook_display = outlook_text.rstrip(" .!")
 
-                if is_high:
+                if is_low:
+                    print(f"🥕 Food Club outlook today: '{outlook_text}' — Low/Very Low, skipping post entirely")
+                    db_set_food_club_status(today_str, outlook_text, False)
+                else:
                     for guild in bot.guilds:
                         channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
-                        role = discord.utils.get(guild.roles, name=FOOD_CLUB_PING_ROLE)
-                        if channel and (role or not FOOD_CLUB_ENABLE_PING):
+                        role = discord.utils.get(guild.roles, name=FOOD_CLUB_PING_ROLE) if should_ping else None
+                        if channel:
                             try:
-                                if FOOD_CLUB_ENABLE_PING and role:
+                                if should_ping and role:
                                     header = f"{role.mention} 🥕 Today's Food Club outlook: **{outlook_display}**!"
                                 else:
-                                    header = f"🥕 Today's Food Club outlook: **{outlook_display}**!"
+                                    header = f"🥕 Today's Food Club outlook: **{outlook_display}**"
                                 message_lines = [header]
 
                                 if bets:
@@ -1189,17 +1203,16 @@ async def food_club_check_loop():
                                     message_lines.append(post_url)
 
                                 await channel.send("\n".join(message_lines))
-                                pinged = True
-                                if FOOD_CLUB_ENABLE_PING and role:
+
+                                if should_ping and role:
+                                    pinged = True
                                     print(f"🥕 Pinged {FOOD_CLUB_PING_ROLE} — outlook: {outlook_text}")
                                 else:
                                     print(f"🥕 Posted (no ping) — outlook: {outlook_text}")
                             except Exception as e:
-                                print(f"⚠️ Food Club: couldn't send ping — {e}")
+                                print(f"⚠️ Food Club: couldn't send message — {e}")
 
-                db_set_food_club_status(today_str, outlook_text, pinged)
-                if not is_high:
-                    print(f"🥕 Food Club outlook today: '{outlook_text}' — no ping needed")
+                    db_set_food_club_status(today_str, outlook_text, pinged)
             else:
                 print(f"🥕 Food Club: no post found for {today_str} yet, will check again in {FOOD_CLUB_CHECK_INTERVAL_HOURS}h")
 

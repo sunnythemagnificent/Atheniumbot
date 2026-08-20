@@ -478,8 +478,6 @@ async def cancel(interaction: discord.Interaction):
         await interaction.response.send_message("You don't have an active art trade request.", ephemeral=True)
 
 
-
-
 # ============================================================
 #  COMMISSIONS
 # ============================================================
@@ -1249,6 +1247,22 @@ async def food_club_check_loop():
     while not bot.is_closed():
         await run_food_club_check()
         await asyncio.sleep(FOOD_CLUB_CHECK_INTERVAL_HOURS * 3600)
+
+
+@bot.tree.command(name="foodclubreset", description="[Mod] Clear today's Food Club check and re-run it immediately")
+async def foodclubreset(interaction: discord.Interaction):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    db_delete_food_club_status(today_str)
+    print(f"🥕 {interaction.user.display_name} manually reset Food Club status for {today_str}")
+
+    result = await run_food_club_check()
+    await interaction.followup.send(f"✅ Re-ran the check.\n**Result:** {result}", ephemeral=True)
 
 
 # ============================================================

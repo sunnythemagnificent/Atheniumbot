@@ -560,7 +560,7 @@ async def opencomms(interaction: discord.Interaction):
 
 def parse_items(text):
     """
-    Parse item lines into a list of (name, avg_value, is_priority, display) tuples.
+    Parse item lines into a list of (name, total_value, is_priority, display) tuples.
     Accepts two formats:
       - 'Item Name:Value'        e.g. 'Liquid Glass Filter:4'
       - 'Item Name - Value Caps' e.g. 'Liquid Glass Filter - 4 Caps'
@@ -568,6 +568,8 @@ def parse_items(text):
       - Ranges, e.g. 'Item:1-2' or 'Item - 1-2 Caps' — the midpoint is used for math,
         the original range is kept for display.
       - A '*' prefix on the name to mark it as a must-keep priority item.
+      - A quantity multiplier, e.g. 'Item - 1.5 Caps (x15)' or 'Item - 1.5 Caps x15'
+        — multiplies the per-unit value by the quantity for the total.
     """
     items = []
     errors = []
@@ -607,10 +609,23 @@ def parse_items(text):
         high = float(match.group(2)) if match.group(2) else low
         if low > high:
             low, high = high, low
-        avg_value = (low + high) / 2
-        display = f"{low:g}" if low == high else f"{low:g}-{high:g}"
+        unit_value = (low + high) / 2
 
-        items.append((name, avg_value, is_priority, display))
+        # Look for a quantity multiplier AFTER the value, e.g. "(x15)" or "x15"
+        quantity = 1
+        qty_match = re.search(r"x\s*(\d+)", value_str[match.end():], re.IGNORECASE)
+        if qty_match:
+            quantity = int(qty_match.group(1))
+
+        total_value = unit_value * quantity
+
+        unit_display = f"{low:g}" if low == high else f"{low:g}-{high:g}"
+        if quantity > 1:
+            display = f"{unit_display} (x{quantity}) = {total_value:g}"
+        else:
+            display = unit_display
+
+        items.append((name, total_value, is_priority, display))
 
     return items, errors
 
@@ -1163,11 +1178,7 @@ async def run_food_club_check():
             channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
             if channel:
                 try:
-                    message_lines = ["🥕 nsheng mentioned all sets are skipping this round."]
-                    if post_url:
-                        message_lines.append("")
-                        message_lines.append(post_url)
-                    await channel.send("\n".join(message_lines))
+                    await channel.send("🥕 nsheng mentioned all sets are skipping this round.")
                     posted_anywhere = True
                 except Exception as e:
                     print(f"⚠️ Food Club: couldn't send message — {e}")
@@ -1185,12 +1196,7 @@ async def run_food_club_check():
             channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
             if channel:
                 try:
-                    message_lines = [f"🥕 Today's Food Club outlook: **{outlook_display}**"]
-                    if post_url:
-                        message_lines.append("")
-                        message_lines.append(post_url)
-
-                    await channel.send("\n".join(message_lines))
+                    await channel.send(f"🥕 Today's Food Club outlook: **{outlook_display}**")
                     posted_anywhere = True
                     print(f"🥕 Posted — outlook: {outlook_text}")
                 except Exception as e:

@@ -630,7 +630,88 @@ def parse_items(text):
     return items, errors
 
 
-def find_best_removal_subsets(items, target_diff, max_options=3):
+def build_value_clusters(items):
+    """Groups items sharing the same value together, e.g. two items both worth 2
+    become one cluster so they can be suggested as 'Item C or Item D' instead
+    of as separate, redundant combo options."""
+    clusters = {}
+    order = []
+    for it in items:
+        key = round(it[1], 4)
+        if key not in clusters:
+            clusters[key] = []
+            order.append(key)
+        clusters[key].append(it)
+    return [(key, clusters[key]) for key in order]
+
+
+def format_cluster_group(cluster):
+    value, item_list = cluster
+    return " or ".join(it[0] for it in item_list)
+
+
+def format_combo_side(chosen_clusters):
+    return " + ".join(format_cluster_group(c) for c in chosen_clusters)
+
+
+def find_matching_combos(side_a_items, side_b_items, max_subset_size=3, max_results=4, tolerance_ratio=0.15):
+    """
+    Finds smaller groupings of items from each side whose combined values are
+    close to each other — e.g. 'your Item A + Item B ≈ their Item G' — rather
+    than only looking at the overall trade balance.
+    Capped in scope to keep this fast even with a handful of items per side.
+    """
+    from itertools import combinations
+
+    clusters_a = build_value_clusters(side_a_items)
+    clusters_b = build_value_clusters(side_b_items)
+
+    # Safety cap — reduce subset depth if there are a lot of distinct clusters
+    if len(clusters_a) > 10 or len(clusters_b) > 10:
+        max_subset_size = min(max_subset_size, 2)
+
+    def gen_subsets(clusters, max_size):
+        n = len(clusters)
+        subsets = []
+        for size in range(1, min(max_size, n) + 1):
+            for combo_idx in combinations(range(n), size):
+                chosen = [clusters[i] for i in combo_idx]
+                total = sum(val for val, _ in chosen)
+                subsets.append((chosen, total))
+        return subsets
+
+    subsets_a = gen_subsets(clusters_a, max_subset_size)
+    subsets_b = gen_subsets(clusters_b, max_subset_size)
+
+    matches = []
+    for subset_a, total_a in subsets_a:
+        for subset_b, total_b in subsets_b:
+            diff = abs(total_a - total_b)
+            tolerance = max(total_a, total_b, 1) * tolerance_ratio
+            if diff <= tolerance:
+                matches.append((subset_a, subset_b, total_a, total_b, diff))
+
+    # Best (closest) matches first, preferring simpler combos when tied
+    matches.sort(key=lambda m: (round(m[4], 2), len(m[0]) + len(m[1])))
+
+    seen = set()
+    unique_matches = []
+    for subset_a, subset_b, total_a, total_b, diff in matches:
+        signature = (
+            frozenset(val for val, _ in subset_a),
+            frozenset(val for val, _ in subset_b),
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        unique_matches.append((subset_a, subset_b, total_a, total_b, diff))
+        if len(unique_matches) >= max_results:
+            break
+
+    return unique_matches
+
+
+
     """
     Find up to `max_options` distinct subsets of `items` whose combined value is
     closest to target_diff. Removing any one of these subsets would balance the trade.
@@ -686,6 +767,10 @@ class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
         placeholder="Pfish Trinket - 3 Caps\nOversized Witch Hat:2-3",
         required=True,
     )
+
+    def __init__(self, include_combos=False):
+        super().__init__()
+        self.include_combos = include_combos
 
     async def on_submit(self, interaction: discord.Interaction):
         your_list, your_errors = parse_items(self.your_items.value)
@@ -758,6 +843,18 @@ class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
                 else:
                     lines.append(f"\n💡 Consider adding roughly **{target:g}** worth of items to the lighter side instead.")
 
+        # Suggest smaller item groupings that could be traded against each other,
+        # separate from the overall balance check above — only if opted in
+        if self.include_combos:
+            combos = find_matching_combos(your_list, their_list)
+            if combos:
+                lines.append("\n🔀 **Possible ways to arrange the trade:**")
+                for subset_a, subset_b, total_a, total_b, combo_diff in combos:
+                    your_side_text = format_combo_side(subset_a)
+                    their_side_text = format_combo_side(subset_b)
+                    gap_note = "" if round(combo_diff, 2) == 0 else f" *(off by ~{round(combo_diff, 2):g})*"
+                    lines.append(f"• Your **{your_side_text}** ({total_a:g}) ≈ their **{their_side_text}** ({total_b:g}){gap_note}")
+
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
@@ -769,7 +866,11 @@ class FairTradeStartView(discord.ui.View):
 
     @discord.ui.button(label="Open Trade Form", style=discord.ButtonStyle.primary, emoji="📝")
     async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(FairTradeModal())
+        await interaction.response.send_modal(FairTradeModal(include_combos=False))
+
+    @discord.ui.button(label="Open Form + Suggest Combos", style=discord.ButtonStyle.secondary, emoji="🔀")
+    async def open_form_with_combos(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(FairTradeModal(include_combos=True))
 
 
 @bot.tree.command(name="fairtrade", description="Check if a Neocash trade is fair and get suggestions to balance it")
@@ -782,9 +883,14 @@ async def fairtrade(interaction: discord.Interaction):
         "• `Item Name - Value Caps` — e.g. `Liquid Glass Filter - 4 Caps`\n\n"
         "**Value can be a range too:**\n"
         "• `Subtle Blush:1-2` or `Subtle Blush - 1-2 Caps` *(the midpoint is used for the math)*\n\n"
+        "**Quantities:** add `(x15)` after the value for multiples —\n"
+        "`Gift Box Capsule:1.5 (x15)` = 22.5 total\n\n"
         "**Priority items:** put a `*` before the name to mark it as a must-keep —\n"
         "`*Rare Item:5` — it will never be suggested for removal.\n\n"
-        "Click below when you're ready to fill out your items!"
+        "**Two ways to open the form:**\n"
+        "📝 **Open Trade Form** — just checks if the trade is fair overall\n"
+        "🔀 **Open Form + Suggest Combos** — also suggests smaller item groupings "
+        "that could be swapped against each other (e.g. \"your A + B ≈ their C\")"
     )
     await interaction.response.send_message(instructions, view=FairTradeStartView(), ephemeral=True)
 

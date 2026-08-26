@@ -711,7 +711,7 @@ def find_matching_combos(side_a_items, side_b_items, max_subset_size=3, max_resu
     return unique_matches
 
 
-
+def find_best_removal_subsets(items, target_diff, max_options=3):
     """
     Find up to `max_options` distinct subsets of `items` whose combined value is
     closest to target_diff. Removing any one of these subsets would balance the trade.

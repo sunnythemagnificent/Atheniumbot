@@ -1757,7 +1757,7 @@ async def sync_activity_once():
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     result = await resp.json()
-                    print(f"📊 Activity sync: {result.get('updated', 0)} members updated")
+                    print(f"📊 Activity sync: {result.get('updated', 0)} members updated | sent {len(updates)}, server received {result.get('debug_received_count', '?')}, raw body {result.get('debug_raw_length', '?')} bytes, json_error={result.get('debug_json_error', '?')}")
             except Exception as e:
                 print(f"⚠️ Activity sync failed: {e}")
 

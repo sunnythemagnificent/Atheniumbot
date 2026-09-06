@@ -1152,9 +1152,18 @@ async def startup_activity_check():
 #  EVENTS
 # ============================================================
 
+_startup_complete = False
+
 @bot.event
 async def on_ready():
+    global _startup_complete
     print(f"✅ Logged in as {bot.user}")
+
+    if _startup_complete:
+        print("🔄 on_ready fired again (likely a reconnect) — setup already done, skipping to avoid duplicate tasks")
+        return
+    _startup_complete = True
+
     print(f"📋 Watching for activity | Role: '{ACTIVE_ROLE_NAME}' | Window: {ACTIVE_DURATION_DAYS} days")
 
     # Load persisted art trade pool from SQLite

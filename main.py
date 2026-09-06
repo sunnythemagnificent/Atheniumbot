@@ -51,7 +51,7 @@ MESSAGE_LOG_RETENTION_DAYS = 185  # needs to cover the 180-day threshold baselin
 # --- Strike system (Discord-only, mod commands) ---
 TEMP_STRIKE_DURATION_DAYS = 45       # how long a temporary "bee sting" strike lasts before fading
 STRIKE_ALERT_THRESHOLD = 3           # active strikes (temp + permanent) that triggers a mod alert
-STRIKE_ALERT_CHANNEL = "mod-alerts"  # channel name (no #) where the alert posts — change to match your server
+STRIKE_ALERT_CHANNEL = "🔴︱mod-alerts"  # channel name (no #) where strike/purge/violation alerts post
 
 # --- Minor violation escalation ladder ---
 # Level 1 -> 30 day cooldown. Re-triggered inside that window -> Level 2 -> 90 day

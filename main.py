@@ -42,6 +42,47 @@ FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's th
 
 BOT_MOD_ROLES = ["Moderator", "Admin", "Coordinator"]   # Role names allowed to use admin commands like /foodclubreset
 
+# --- Activity tracker (mod-only page on the website) ---
+ACTIVITY_SYNC_URL = os.environ.get("ACTIVITY_SYNC_URL", "https://mods.athenaeumarchive.com/activity_sync.php")
+ACTIVITY_SYNC_SECRET = os.environ.get("ACTIVITY_SYNC_SECRET")  # shared secret, set this on Railway
+ACTIVITY_SYNC_INTERVAL_HOURS = 1
+MESSAGE_LOG_RETENTION_DAYS = 185  # needs to cover the 180-day threshold baseline window, plus a small buffer
+
+# --- Strike system (Discord-only, mod commands) ---
+TEMP_STRIKE_DURATION_DAYS = 45       # how long a temporary "bee sting" strike lasts before fading
+STRIKE_ALERT_THRESHOLD = 3           # active strikes (temp + permanent) that triggers a mod alert
+STRIKE_ALERT_CHANNEL = "mod-alerts"  # channel name (no #) where the alert posts — change to match your server
+
+# --- Minor violation escalation ladder ---
+# Level 1 -> 30 day cooldown. Re-triggered inside that window -> Level 2 -> 90 day
+# cooldown. Re-triggered inside THAT window -> flagged for manual ban (bot never
+# bans automatically). If a cooldown fully expires with no re-trigger, the next
+# violation starts fresh back at Level 1.
+MINOR_VIOLATION_LEVEL1_COOLDOWN_DAYS = 30
+MINOR_VIOLATION_LEVEL2_COOLDOWN_DAYS = 90  # ~3 months
+
+# --- Adaptive activity thresholds ---
+# Rather than fixed guessed numbers, the "Really Active" / "Active" cutoffs
+# are recalculated from actual server-wide posting data every 30 days, using
+# a 6-month trailing window. Slow-moving on purpose — see conversation notes
+# on why a fast-reacting baseline could mask a real decline.
+THRESHOLD_BASELINE_WINDOW_DAYS = 180
+THRESHOLD_RECALC_INTERVAL_DAYS = 30
+THRESHOLD_HIGH_PERCENTILE = 0.85   # top 15% of posters -> "Really Active" cutoff
+THRESHOLD_MEDIUM_PERCENTILE = 0.60  # top 40% of posters -> "Active" cutoff
+THRESHOLD_MIN_SAMPLE_SIZE = 10      # don't recalculate off too small a sample
+DEFAULT_HIGH_THRESHOLD = 40.0        # grounded in real member data (was 150 — see conversation notes)
+DEFAULT_MEDIUM_THRESHOLD = 10.0      # was 80
+
+# --- Inactivity purge notifications ---
+# Mods still remove people manually — this just tells them when someone
+# crosses the threshold, instead of relying on someone remembering to check.
+# Server boosters are fully immune as long as they're currently boosting.
+PURGE_THRESHOLD_DAYS = 180          # ~6 months of total silence
+PURGE_HIATUS_THRESHOLD_DAYS = 360   # ~12 months if flagged as on hiatus
+PURGE_CHECK_INTERVAL_HOURS = 24
+HIATUS_LIST_URL = os.environ.get("HIATUS_LIST_URL", "https://mods.athenaeumarchive.com/hiatus_list.php")
+
 # Where the persistent database lives — this should point inside your Railway Volume
 DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
 
@@ -83,6 +124,61 @@ def init_db():
             date TEXT PRIMARY KEY,
             outlook TEXT,
             pinged INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS message_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            channel_name TEXT NOT NULL,
+            posted_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_user ON message_log(user_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_time ON message_log(posted_at)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS strikes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            strike_type TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            issued_by TEXT NOT NULL,
+            issued_at TEXT NOT NULL,
+            expires_at TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_strikes_user ON strikes(user_id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS minor_violation_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            level INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            issued_by TEXT NOT NULL,
+            issued_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_minor_violation_user ON minor_violation_log(user_id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS activity_thresholds (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            high_threshold REAL NOT NULL,
+            medium_threshold REAL NOT NULL,
+            sample_size INTEGER NOT NULL,
+            computed_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS member_last_seen (
+            user_id INTEGER PRIMARY KEY,
+            last_seen_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS purge_flags (
+            user_id INTEGER PRIMARY KEY,
+            flagged_at TEXT NOT NULL,
+            reason TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -1036,6 +1132,10 @@ async def on_ready():
     bot.loop.create_task(check_expirations())
     bot.loop.create_task(startup_activity_check())
     bot.loop.create_task(food_club_check_loop())
+    bot.loop.create_task(activity_sync_loop())
+    bot.loop.create_task(prune_message_log_loop())
+    bot.loop.create_task(threshold_recalc_loop())
+    bot.loop.create_task(purge_check_loop())
 
 
 @bot.event
@@ -1071,6 +1171,27 @@ async def on_message(message):
 
     if message.channel.name in IGNORED_CHANNELS:
         return
+
+    # --------------------------------------------------------
+    #  ACTIVITY LOGGING (for the mod-only activity tracker)
+    # --------------------------------------------------------
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO message_log (user_id, channel_name, posted_at) VALUES (?, ?, ?)",
+        (message.author.id, message.channel.name, now_iso)
+    )
+    # Permanent last-seen record — never pruned, so the 6-month purge check
+    # still works correctly even past the rolling activity window.
+    conn.execute("""
+        INSERT INTO member_last_seen (user_id, last_seen_at) VALUES (?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+    """, (message.author.id, now_iso))
+    # If they were flagged for the inactivity purge, they've clearly come
+    # back — clear it so mods aren't looking at a stale flag.
+    conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (message.author.id,))
+    conn.commit()
+    conn.close()
 
     # --------------------------------------------------------
     #  ACTIVE ROLE TRACKING
@@ -1325,6 +1446,512 @@ async def food_club_check_loop():
     while not bot.is_closed():
         await run_food_club_check()
         await asyncio.sleep(FOOD_CLUB_CHECK_INTERVAL_HOURS * 3600)
+
+
+# ============================================================
+#  ACTIVITY TRACKER — computes tiers and pushes them to the
+#  mod-only page on the website. Nothing here is visible to
+#  regular members; it's purely a check-in tool for staff.
+# ============================================================
+
+def get_current_thresholds():
+    """Returns (high_threshold, medium_threshold, computed_at) — falls back
+    to the starting defaults until enough real data exists to compute from."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM activity_thresholds WHERE id = 1").fetchone()
+    conn.close()
+
+    if row is None:
+        return (DEFAULT_HIGH_THRESHOLD, DEFAULT_MEDIUM_THRESHOLD, None)
+    return (row["high_threshold"], row["medium_threshold"], row["computed_at"])
+
+
+def recalculate_activity_thresholds():
+    """Looks at every member's actual posting rate over the trailing 6-month
+    window and derives the Really Active / Active cutoffs from real
+    percentiles, instead of a fixed guess. Runs monthly — slow on purpose,
+    so it can't quietly absorb a real decline the way a fast-reacting
+    baseline could."""
+    conn = get_db()
+    window_start = (datetime.now(timezone.utc) - timedelta(days=THRESHOLD_BASELINE_WINDOW_DAYS)).isoformat()
+
+    rows = conn.execute(
+        "SELECT user_id, COUNT(*) as cnt FROM message_log WHERE posted_at >= ? GROUP BY user_id",
+        (window_start,)
+    ).fetchall()
+
+    daily_rates = sorted((r["cnt"] / THRESHOLD_BASELINE_WINDOW_DAYS) for r in rows)
+    sample_size = len(daily_rates)
+
+    if sample_size < THRESHOLD_MIN_SAMPLE_SIZE:
+        conn.close()
+        print(f"📊 Threshold recalc skipped — only {sample_size} members with data, need {THRESHOLD_MIN_SAMPLE_SIZE}")
+        return
+
+    high_idx = min(int(sample_size * THRESHOLD_HIGH_PERCENTILE), sample_size - 1)
+    medium_idx = min(int(sample_size * THRESHOLD_MEDIUM_PERCENTILE), sample_size - 1)
+    high_threshold = round(daily_rates[high_idx], 1)
+    medium_threshold = round(daily_rates[medium_idx], 1)
+
+    # Sanity guard: high should never end up below medium (can happen with
+    # small/lopsided samples) — if so, just keep the previous thresholds.
+    if high_threshold <= medium_threshold:
+        conn.close()
+        print(f"📊 Threshold recalc skipped — computed high ({high_threshold}) <= medium ({medium_threshold}), keeping previous values")
+        return
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    conn.execute("""
+        INSERT INTO activity_thresholds (id, high_threshold, medium_threshold, sample_size, computed_at)
+        VALUES (1, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            high_threshold = excluded.high_threshold,
+            medium_threshold = excluded.medium_threshold,
+            sample_size = excluded.sample_size,
+            computed_at = excluded.computed_at
+    """, (high_threshold, medium_threshold, sample_size, now_iso))
+    conn.commit()
+    conn.close()
+    print(f"📊 Recalculated activity thresholds from {sample_size} members: High={high_threshold}/day, Medium={medium_threshold}/day")
+
+
+async def threshold_recalc_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        recalculate_activity_thresholds()
+        await asyncio.sleep(THRESHOLD_RECALC_INTERVAL_DAYS * 24 * 3600)
+
+
+# ============================================================
+#  INACTIVITY PURGE NOTIFICATIONS
+#  Flags members who've been fully silent for 6+ months (12+ if on
+#  hiatus) so mods know to review them — never removes anyone
+#  automatically. Server boosters are fully immune while boosting.
+# ============================================================
+
+async def fetch_hiatus_discord_ids() -> set:
+    """Pulls the current hiatus list from the website (set via mod_activity.php),
+    so this stays the single source of truth rather than a separate bot-side list."""
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(
+                HIATUS_LIST_URL,
+                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                data = await resp.json()
+                return set(data.get("discord_ids", []))
+        except Exception as e:
+            print(f"⚠️ Could not fetch hiatus list, treating nobody as on hiatus this run: {e}")
+            return set()
+
+
+async def run_purge_check():
+    if not ACTIVITY_SYNC_SECRET:
+        print("⚠️ ACTIVITY_SYNC_SECRET not set — skipping purge check")
+        return
+
+    hiatus_ids = await fetch_hiatus_discord_ids()
+    now = datetime.now(timezone.utc)
+    conn = get_db()
+
+    for guild in bot.guilds:
+        alert_channel = discord.utils.get(guild.text_channels, name=STRIKE_ALERT_CHANNEL)
+
+        for member in guild.members:
+            if member.bot:
+                continue
+
+            # Server boosters are fully immune while currently boosting.
+            if member.premium_since is not None:
+                continue
+
+            row = conn.execute(
+                "SELECT last_seen_at FROM member_last_seen WHERE user_id = ?",
+                (member.id,)
+            ).fetchone()
+
+            if row:
+                last_activity = datetime.fromisoformat(row["last_seen_at"])
+            else:
+                # Never posted at all since we started tracking — fall back
+                # to their join date as the reference point.
+                last_activity = member.joined_at or now
+
+            on_hiatus = str(member.id) in hiatus_ids
+            threshold_days = PURGE_HIATUS_THRESHOLD_DAYS if on_hiatus else PURGE_THRESHOLD_DAYS
+            days_silent = (now - last_activity).days
+
+            already_flagged = conn.execute(
+                "SELECT 1 FROM purge_flags WHERE user_id = ?", (member.id,)
+            ).fetchone()
+
+            if days_silent >= threshold_days and not already_flagged:
+                conn.execute(
+                    "INSERT INTO purge_flags (user_id, flagged_at, reason) VALUES (?, ?, ?)",
+                    (member.id, now.isoformat(), f"{days_silent} days silent")
+                )
+                conn.commit()
+
+                hiatus_note = " (was on hiatus — got the extended window)" if on_hiatus else ""
+                if alert_channel:
+                    await alert_channel.send(
+                        f"🕸️ **{member.display_name}** has been silent for **{days_silent} days**"
+                        f"{hiatus_note} — past the inactivity threshold. Might be time to review/remove them."
+                    )
+                else:
+                    print(f"⚠️ Alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post purge flag for {member.display_name}")
+
+    conn.close()
+
+
+async def purge_check_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await run_purge_check()
+        await asyncio.sleep(PURGE_CHECK_INTERVAL_HOURS * 3600)
+
+
+def compute_member_activity(user_id: int):
+    """Returns (tier, avg_daily_messages, last_seen_iso, last_channel) for one user."""
+    conn = get_db()
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(days=30)).isoformat()
+
+    row = conn.execute(
+        "SELECT COUNT(*) as cnt FROM message_log WHERE user_id = ? AND posted_at >= ?",
+        (user_id, window_start)
+    ).fetchone()
+    avg_daily = round((row["cnt"] or 0) / 30, 1)
+
+    last_row = conn.execute(
+        "SELECT channel_name, posted_at FROM message_log WHERE user_id = ? ORDER BY posted_at DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+
+    if last_row is None:
+        return ("Rarely Posts", 0.0, None, None)
+
+    last_seen = datetime.fromisoformat(last_row["posted_at"])
+    days_since = (now - last_seen).days
+
+    high_threshold, medium_threshold, _ = get_current_thresholds()
+
+    if days_since >= 30:
+        tier = "Rarely Posts"
+    elif days_since >= 15:
+        tier = "Occasional"
+    elif avg_daily >= high_threshold:
+        tier = "Really Active"
+    elif avg_daily >= medium_threshold:
+        tier = "Active"
+    else:
+        tier = "Occasional"
+
+    return (tier, avg_daily, last_row["posted_at"], last_row["channel_name"])
+
+
+async def sync_activity_once():
+    if not ACTIVITY_SYNC_SECRET:
+        print("⚠️ ACTIVITY_SYNC_SECRET not set — skipping activity sync")
+        return
+
+    for guild in bot.guilds:
+        updates = []
+        for member in guild.members:
+            if member.bot:
+                continue
+            tier, avg_daily, last_seen, last_channel = compute_member_activity(member.id)
+            updates.append({
+                "discord_id": str(member.id),
+                "display_name": member.display_name,
+                "tier": tier,
+                "avg_daily_messages": avg_daily,
+                "last_seen_at": last_seen,
+                "last_channel": last_channel,
+            })
+
+        if not updates:
+            continue
+
+        high_threshold, medium_threshold, computed_at = get_current_thresholds()
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.post(
+                    ACTIVITY_SYNC_URL,
+                    json={
+                        "updates": updates,
+                        "thresholds": {
+                            "high_threshold": high_threshold,
+                            "medium_threshold": medium_threshold,
+                            "computed_at": computed_at,
+                        },
+                    },
+                    headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    result = await resp.json()
+                    print(f"📊 Activity sync: {result.get('updated', 0)} members updated")
+            except Exception as e:
+                print(f"⚠️ Activity sync failed: {e}")
+
+
+async def activity_sync_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await sync_activity_once()
+        await asyncio.sleep(ACTIVITY_SYNC_INTERVAL_HOURS * 3600)
+
+
+async def prune_message_log_loop():
+    """Keeps message_log from growing forever — deletes anything older
+    than the retention window once a day."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=MESSAGE_LOG_RETENTION_DAYS)).isoformat()
+        conn = get_db()
+        conn.execute("DELETE FROM message_log WHERE posted_at < ?", (cutoff,))
+        conn.commit()
+        conn.close()
+        await asyncio.sleep(24 * 3600)
+
+
+# ============================================================
+#  STRIKE SYSTEM — mod-only, Discord-side only (no website
+#  component, per Sunny's direction). Temporary strikes fade
+#  automatically; permanent ones don't.
+# ============================================================
+
+def get_active_strikes(user_id: int):
+    conn = get_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    rows = conn.execute("""
+        SELECT * FROM strikes
+        WHERE user_id = ?
+        AND (strike_type = 'permanent' OR (strike_type = 'temporary' AND expires_at > ?))
+        ORDER BY issued_at DESC
+    """, (user_id, now_iso)).fetchall()
+    conn.close()
+    return rows
+
+
+@bot.tree.command(name="strike", description="[Mod] Issue a strike to a member")
+@app_commands.describe(
+    member="Who this strike is for",
+    strike_type="Temporary strikes fade automatically; permanent ones don't",
+    reason="What happened",
+)
+@app_commands.choices(strike_type=[
+    app_commands.Choice(name="Temporary (fades in ~45 days)", value="temporary"),
+    app_commands.Choice(name="Permanent", value="permanent"),
+])
+async def strike(interaction: discord.Interaction, member: discord.Member, strike_type: app_commands.Choice[str], reason: str):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(days=TEMP_STRIKE_DURATION_DAYS)).isoformat() if strike_type.value == "temporary" else None
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO strikes (user_id, strike_type, reason, issued_by, issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (member.id, strike_type.value, reason, str(interaction.user), now.isoformat(), expires_at)
+    )
+    conn.commit()
+    conn.close()
+
+    active = get_active_strikes(member.id)
+
+    await interaction.response.send_message(
+        f"✅ {strike_type.name} strike issued to {member.display_name}. They now have **{len(active)}** active strike(s).",
+        ephemeral=True
+    )
+
+    if len(active) >= STRIKE_ALERT_THRESHOLD:
+        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
+        if alert_channel:
+            await alert_channel.send(
+                f"⚠️ **{member.display_name}** has reached **{len(active)}** active strikes. "
+                f"Might be time for a serious conversation with them."
+            )
+        else:
+            print(f"⚠️ Strike alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post alert")
+
+
+@bot.tree.command(name="strikes", description="[Mod] View a member's active strike history")
+@app_commands.describe(member="Whose strikes to look up")
+async def strikes(interaction: discord.Interaction, member: discord.Member):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    active = get_active_strikes(member.id)
+
+    if not active:
+        await interaction.response.send_message(f"{member.display_name} has no active strikes.", ephemeral=True)
+        return
+
+    lines = [f"**Active strikes for {member.display_name}:**"]
+    for s in active:
+        expiry_note = f" (fades {s['expires_at'][:10]})" if s["strike_type"] == "temporary" else " (permanent)"
+        lines.append(f"`#{s['id']}` — {s['reason']} — issued by {s['issued_by']} on {s['issued_at'][:10]}{expiry_note}")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="removestrike", description="[Mod] Remove a strike by its ID (see /strikes for IDs)")
+@app_commands.describe(strike_id="The strike ID shown in /strikes")
+async def removestrike(interaction: discord.Interaction, strike_id: int):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    conn = get_db()
+    cursor = conn.execute("DELETE FROM strikes WHERE id = ?", (strike_id,))
+    conn.commit()
+    conn.close()
+
+    if cursor.rowcount > 0:
+        await interaction.response.send_message(f"✅ Strike `#{strike_id}` removed.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⚠️ No strike found with ID `#{strike_id}`.", ephemeral=True)
+
+
+# ============================================================
+#  MINOR VIOLATION ESCALATION LADDER
+#  Level 1 (30 day CD) -> retrigger inside window -> Level 2 (90 day CD)
+#  -> retrigger inside window -> flagged for manual ban (never auto-banned).
+#  A fully-expired cooldown with no retrigger resets back to Level 1.
+# ============================================================
+
+def get_next_violation_level(user_id: int) -> int:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT level, issued_at FROM minor_violation_log WHERE user_id = ? ORDER BY issued_at DESC LIMIT 1",
+        (user_id,)
+    ).fetchone()
+    conn.close()
+
+    if row is None:
+        return 1
+
+    # Already flagged for a ban that hasn't happened yet — keep re-flagging,
+    # there's no level beyond this.
+    if row["level"] >= 3:
+        return 3
+
+    cooldown_days = MINOR_VIOLATION_LEVEL1_COOLDOWN_DAYS if row["level"] == 1 else MINOR_VIOLATION_LEVEL2_COOLDOWN_DAYS
+    issued_at = datetime.fromisoformat(row["issued_at"])
+    cooldown_expired = datetime.now(timezone.utc) > issued_at + timedelta(days=cooldown_days)
+
+    if cooldown_expired:
+        return 1  # clean slate
+    return row["level"] + 1  # escalate
+
+
+@bot.tree.command(name="minorviolation", description="[Mod] Log a minor rule violation (escalates automatically on repeat offenses)")
+@app_commands.describe(member="Who this is for", reason="What happened")
+async def minorviolation(interaction: discord.Interaction, member: discord.Member, reason: str):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    new_level = get_next_violation_level(member.id)
+    now = datetime.now(timezone.utc)
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO minor_violation_log (user_id, level, reason, issued_by, issued_at) VALUES (?, ?, ?, ?, ?)",
+        (member.id, new_level, reason, str(interaction.user), now.isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+    if new_level == 1:
+        await interaction.response.send_message(
+            f"✅ Logged as a **Level 1** minor violation for {member.display_name} (30-day cooldown started).",
+            ephemeral=True
+        )
+    elif new_level == 2:
+        await interaction.response.send_message(
+            f"⚠️ {member.display_name} re-offended within the cooldown window — escalated to **Level 2** (90-day cooldown). One more within that window and they'll be flagged for a ban review.",
+            ephemeral=True
+        )
+        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
+        if alert_channel:
+            await alert_channel.send(
+                f"⚠️ **{member.display_name}** has escalated to **Level 2** minor violations "
+                f"(re-offended within the 30-day window). Latest reason: {reason}"
+            )
+    else:  # new_level == 3
+        await interaction.response.send_message(
+            f"🚨 {member.display_name} has triggered a **3rd violation** within the escalation window. "
+            f"This is a ban recommendation, not an automatic ban — see the mod-alerts channel.",
+            ephemeral=True
+        )
+        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
+        if alert_channel:
+            await alert_channel.send(
+                f"🚨 **BAN REVIEW NEEDED:** {member.display_name} has hit a 3rd minor violation "
+                f"within the escalation window (Level 2 -> retrigger). Per guild policy this calls for a ban. "
+                f"Latest reason: {reason}\n"
+                f"The bot will NOT ban automatically — a mod needs to review and take action manually."
+            )
+        else:
+            print(f"⚠️ Alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post ban-review flag")
+
+
+@bot.tree.command(name="violations", description="[Mod] View a member's minor violation history and current status")
+@app_commands.describe(member="Whose violation history to look up")
+async def violations(interaction: discord.Interaction, member: discord.Member):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM minor_violation_log WHERE user_id = ? ORDER BY issued_at DESC LIMIT 10",
+        (member.id,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message(f"{member.display_name} has no minor violation history.", ephemeral=True)
+        return
+
+    current_level = get_next_violation_level(member.id)
+    status_note = {
+        1: "Clean slate — no active cooldown (or none yet logged).",
+        2: "Currently at Level 1, inside its 30-day cooldown.",
+        3: "Currently at Level 2 or pending ban review — inside its cooldown, or flagged.",
+    }[current_level] if rows else "No history."
+
+    lines = [f"**Minor violation history for {member.display_name}:**", f"_{status_note}_", ""]
+    for r in rows:
+        lines.append(f"Level {r['level']} — {r['reason']} — by {r['issued_by']} on {r['issued_at'][:10]}")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="clearpurgeflag", description="[Mod] Dismiss an inactivity purge flag for a member")
+@app_commands.describe(member="Who to clear the flag for")
+async def clearpurgeflag(interaction: discord.Interaction, member: discord.Member):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    conn = get_db()
+    cursor = conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (member.id,))
+    conn.commit()
+    conn.close()
+
+    if cursor.rowcount > 0:
+        await interaction.response.send_message(f"✅ Purge flag cleared for {member.display_name}.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"{member.display_name} wasn't flagged.", ephemeral=True)
 
 
 @bot.tree.command(name="foodclubreset", description="[Mod] Clear today's Food Club check and re-run it immediately")

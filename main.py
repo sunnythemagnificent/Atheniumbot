@@ -1167,6 +1167,16 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Failed to sync slash commands: {e}")
 
+    # Fully load every guild's member list BEFORE starting any background
+    # tasks — otherwise multiple tasks starting at once can each race to
+    # chunk the same guild independently, and some can end up running
+    # against an incomplete member list.
+    for guild in bot.guilds:
+        if not guild.chunked:
+            print(f"📥 Loading full member list for {guild.name}...")
+            await guild.chunk()
+            print(f"✅ {guild.name} fully loaded ({len(guild.members)} members)")
+
     bot.loop.create_task(check_expirations())
     bot.loop.create_task(startup_activity_check())
     bot.loop.create_task(food_club_check_loop())

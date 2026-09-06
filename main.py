@@ -1031,11 +1031,39 @@ async def maybe_ping_giveaway(message):
 #  STARTUP ACTIVITY CHECK
 # ============================================================
 
+def has_sufficient_message_history() -> bool:
+    """Checks whether message_log has been running long enough (a full
+    ACTIVE_DURATION_DAYS window) to safely replace the old full-channel-scan
+    with a fast local lookup. Returns False until then, so the bot falls
+    back to the slower-but-reliable Discord history scan in the meantime."""
+    conn = get_db()
+    row = conn.execute("SELECT MIN(posted_at) as oldest FROM message_log").fetchone()
+    conn.close()
+
+    if row is None or row["oldest"] is None:
+        return False
+
+    oldest = datetime.fromisoformat(row["oldest"])
+    return (datetime.now(timezone.utc) - oldest).days >= ACTIVE_DURATION_DAYS
+
+
 async def startup_activity_check():
     await bot.wait_until_ready()
     print(f"🔍 Running startup activity check...")
 
+    use_local_data = has_sufficient_message_history()
+    if use_local_data:
+        print("📊 message_log has enough history — using the fast local lookup instead of scanning Discord")
+    else:
+        print("📊 message_log doesn't have a full 30-day history yet — falling back to the slower full channel scan for now")
+
     for guild in bot.guilds:
+        # Force a full member list load — the automatic chunking Discord
+        # does in the background isn't always finished by the time this
+        # runs, which can otherwise make guild.members look empty.
+        if not guild.chunked:
+            await guild.chunk()
+
         active_role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
         if not active_role:
             print(f"⚠️ Role '{ACTIVE_ROLE_NAME}' not found in {guild.name}")
@@ -1051,24 +1079,34 @@ async def startup_activity_check():
         print(f"📋 Checking {len(active_members)} members with Active role...")
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=ACTIVE_DURATION_DAYS)
-
-        # Build a map of user_id -> most recent post time by scanning each
-        # channel ONCE (newest messages first), instead of per-member per-channel.
-        # This avoids missing posts in busy channels that have 500+ messages
-        # since the cutoff date.
         last_post_map = {}
 
-        for channel in valid_channels:
-            try:
-                async for msg in channel.history(limit=None, after=cutoff, oldest_first=False):
-                    if msg.author.bot:
-                        continue
-                    existing = last_post_map.get(msg.author.id)
-                    if existing is None or msg.created_at > existing:
-                        last_post_map[msg.author.id] = msg.created_at
-            except Exception as e:
-                print(f"⚠️ Could not scan #{channel.name}: {e}")
-                continue
+        if use_local_data:
+            # Fast path: message_log already tracks this continuously and
+            # respects the same channel exclusions (IGNORED_CHANNELS and the
+            # giveaway channel never get logged there in the first place).
+            conn = get_db()
+            rows = conn.execute(
+                "SELECT user_id, MAX(posted_at) as last_post FROM message_log WHERE posted_at >= ? GROUP BY user_id",
+                (cutoff.isoformat(),)
+            ).fetchall()
+            conn.close()
+            for row in rows:
+                last_post_map[row["user_id"]] = datetime.fromisoformat(row["last_post"])
+        else:
+            # Slow fallback: scan full channel history. Only used until
+            # message_log has accumulated a full 30-day window on its own.
+            for channel in valid_channels:
+                try:
+                    async for msg in channel.history(limit=None, after=cutoff, oldest_first=False):
+                        if msg.author.bot:
+                            continue
+                        existing = last_post_map.get(msg.author.id)
+                        if existing is None or msg.created_at > existing:
+                            last_post_map[msg.author.id] = msg.created_at
+                except Exception as e:
+                    print(f"⚠️ Could not scan #{channel.name}: {e}")
+                    continue
 
         for member in active_members:
             if member.bot:
@@ -1556,6 +1594,9 @@ async def run_purge_check():
     conn = get_db()
 
     for guild in bot.guilds:
+        if not guild.chunked:
+            await guild.chunk()
+
         alert_channel = discord.utils.get(guild.text_channels, name=STRIKE_ALERT_CHANNEL)
 
         for member in guild.members:
@@ -1658,6 +1699,9 @@ async def sync_activity_once():
         return
 
     for guild in bot.guilds:
+        if not guild.chunked:
+            await guild.chunk()
+
         updates = []
         for member in guild.members:
             if member.bot:

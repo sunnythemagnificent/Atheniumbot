@@ -49,7 +49,8 @@ ACTIVITY_SYNC_INTERVAL_HOURS = 1
 MESSAGE_LOG_RETENTION_DAYS = 185  # needs to cover the 180-day threshold baseline window, plus a small buffer
 
 # --- Strike system (Discord-only, mod commands) ---
-TEMP_STRIKE_DURATION_DAYS = 45       # how long a temporary "bee sting" strike lasts before fading
+TEMP_STRIKE_DURATION_DAYS = 45       # how long a first temporary "bee sting" strike lasts before fading
+TEMP_STRIKE_ESCALATED_DURATION_DAYS = 90  # ~3 months — used if a NEW temp strike lands while a previous one is still active
 STRIKE_ALERT_THRESHOLD = 3           # active strikes (temp + permanent) that triggers a mod alert
 STRIKE_ALERT_CHANNEL = "🔴︱mod-alerts"  # channel name (no #) where strike/purge/violation alerts post
 
@@ -1172,10 +1173,10 @@ async def on_ready():
     # chunk the same guild independently, and some can end up running
     # against an incomplete member list.
     for guild in bot.guilds:
+        print(f"📥 Checking member list for {guild.name} (already loaded: {guild.chunked})...")
         if not guild.chunked:
-            print(f"📥 Loading full member list for {guild.name}...")
             await guild.chunk()
-            print(f"✅ {guild.name} fully loaded ({len(guild.members)} members)")
+        print(f"✅ {guild.name} ready ({len(guild.members)} members)")
 
     bot.loop.create_task(check_expirations())
     bot.loop.create_task(startup_activity_check())
@@ -1791,6 +1792,23 @@ def get_active_strikes(user_id: int):
     return rows
 
 
+def get_temp_strike_duration_days(user_id: int) -> int:
+    """A new temporary strike normally lasts 45 days. But if the member
+    already has a temporary strike that's still active (hasn't faded yet),
+    this one escalates to 90 days instead — same "re-offend before the
+    cooldown ends" logic as the minor violation ladder."""
+    conn = get_db()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = conn.execute("""
+        SELECT 1 FROM strikes
+        WHERE user_id = ? AND strike_type = 'temporary' AND expires_at > ?
+        LIMIT 1
+    """, (user_id, now_iso)).fetchone()
+    conn.close()
+
+    return TEMP_STRIKE_ESCALATED_DURATION_DAYS if row else TEMP_STRIKE_DURATION_DAYS
+
+
 @bot.tree.command(name="strike", description="[Mod] Issue a strike to a member")
 @app_commands.describe(
     member="Who this strike is for",
@@ -1798,7 +1816,7 @@ def get_active_strikes(user_id: int):
     reason="What happened",
 )
 @app_commands.choices(strike_type=[
-    app_commands.Choice(name="Temporary (fades in ~45 days)", value="temporary"),
+    app_commands.Choice(name="Temporary (45 days, or 90 if they already have one active)", value="temporary"),
     app_commands.Choice(name="Permanent", value="permanent"),
 ])
 async def strike(interaction: discord.Interaction, member: discord.Member, strike_type: app_commands.Choice[str], reason: str):
@@ -1806,8 +1824,18 @@ async def strike(interaction: discord.Interaction, member: discord.Member, strik
         await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
         return
 
+    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
+        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+        return
+
     now = datetime.now(timezone.utc)
-    expires_at = (now + timedelta(days=TEMP_STRIKE_DURATION_DAYS)).isoformat() if strike_type.value == "temporary" else None
+    escalated = False
+    if strike_type.value == "temporary":
+        duration_days = get_temp_strike_duration_days(member.id)
+        escalated = duration_days == TEMP_STRIKE_ESCALATED_DURATION_DAYS
+        expires_at = (now + timedelta(days=duration_days)).isoformat()
+    else:
+        expires_at = None
 
     conn = get_db()
     conn.execute(
@@ -1819,20 +1847,18 @@ async def strike(interaction: discord.Interaction, member: discord.Member, strik
 
     active = get_active_strikes(member.id)
 
-    await interaction.response.send_message(
-        f"✅ {strike_type.name} strike issued to {member.display_name}. They now have **{len(active)}** active strike(s).",
-        ephemeral=True
-    )
+    escalation_note = ""
+    if escalated:
+        escalation_note = f"\n📈 This escalated to a **{TEMP_STRIKE_ESCALATED_DURATION_DAYS}-day** cooldown since they still had an active temporary strike."
 
+    threshold_note = ""
     if len(active) >= STRIKE_ALERT_THRESHOLD:
-        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
-        if alert_channel:
-            await alert_channel.send(
-                f"⚠️ **{member.display_name}** has reached **{len(active)}** active strikes. "
-                f"Might be time for a serious conversation with them."
-            )
-        else:
-            print(f"⚠️ Strike alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post alert")
+        threshold_note = "\n⚠️ Might be time for a serious conversation with them."
+
+    await interaction.response.send_message(
+        f"✅ {strike_type.name} strike issued to {member.display_name}. They now have **{len(active)}** active strike(s).{escalation_note}{threshold_note}",
+        ephemeral=False
+    )
 
 
 @bot.tree.command(name="strikes", description="[Mod] View a member's active strike history")
@@ -1842,18 +1868,22 @@ async def strikes(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
         return
 
+    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
+        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+        return
+
     active = get_active_strikes(member.id)
 
     if not active:
-        await interaction.response.send_message(f"{member.display_name} has no active strikes.", ephemeral=True)
+        await interaction.response.send_message(f"{member.display_name} has no active strikes.", ephemeral=False)
         return
 
     lines = [f"**Active strikes for {member.display_name}:**"]
     for s in active:
-        expiry_note = f" (fades {s['expires_at'][:10]})" if s["strike_type"] == "temporary" else " (permanent)"
-        lines.append(f"`#{s['id']}` — {s['reason']} — issued by {s['issued_by']} on {s['issued_at'][:10]}{expiry_note}")
+        type_label = f"Temporary (fades {s['expires_at'][:10]})" if s["strike_type"] == "temporary" else "Permanent"
+        lines.append(f"`#{s['id']}` — **{type_label}** — {s['reason']} — issued by {s['issued_by']} on {s['issued_at'][:10]}")
 
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.response.send_message("\n".join(lines), ephemeral=False)
 
 
 @bot.tree.command(name="removestrike", description="[Mod] Remove a strike from a member")
@@ -1863,15 +1893,19 @@ async def removestrike(interaction: discord.Interaction, member: discord.Member,
         await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
         return
 
+    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
+        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+        return
+
     conn = get_db()
     cursor = conn.execute("DELETE FROM strikes WHERE id = ? AND user_id = ?", (strike_id, member.id))
     conn.commit()
     conn.close()
 
     if cursor.rowcount > 0:
-        await interaction.response.send_message(f"✅ Strike `#{strike_id}` removed for {member.display_name}.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Strike `#{strike_id}` removed for {member.display_name}.", ephemeral=False)
     else:
-        await interaction.response.send_message(f"⚠️ No strike with ID `#{strike_id}` found for {member.display_name}.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ No strike with ID `#{strike_id}` found for {member.display_name}.", ephemeral=False)
 
 
 @removestrike.autocomplete('strike_id')
@@ -1927,6 +1961,10 @@ async def minorviolation(interaction: discord.Interaction, member: discord.Membe
         await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
         return
 
+    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
+        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+        return
+
     new_level = get_next_violation_level(member.id)
     now = datetime.now(timezone.utc)
 
@@ -1938,38 +1976,28 @@ async def minorviolation(interaction: discord.Interaction, member: discord.Membe
     conn.commit()
     conn.close()
 
+    # Responses are public since this command only runs in the mod-alerts
+    # channel to begin with — no need for a separate duplicate alert message.
     if new_level == 1:
         await interaction.response.send_message(
             f"✅ Logged as a **Level 1** minor violation for {member.display_name} (30-day cooldown started).",
-            ephemeral=True
+            ephemeral=False
         )
     elif new_level == 2:
         await interaction.response.send_message(
-            f"⚠️ {member.display_name} re-offended within the cooldown window — escalated to **Level 2** (90-day cooldown). One more within that window and they'll be flagged for a ban review.",
-            ephemeral=True
+            f"⚠️ **{member.display_name}** re-offended within the cooldown window — escalated to **Level 2** "
+            f"(90-day cooldown). One more within that window and they'll be flagged for a ban review. "
+            f"Latest reason: {reason}",
+            ephemeral=False
         )
-        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
-        if alert_channel:
-            await alert_channel.send(
-                f"⚠️ **{member.display_name}** has escalated to **Level 2** minor violations "
-                f"(re-offended within the 30-day window). Latest reason: {reason}"
-            )
     else:  # new_level == 3
         await interaction.response.send_message(
-            f"🚨 {member.display_name} has triggered a **3rd violation** within the escalation window. "
-            f"This is a ban recommendation, not an automatic ban — see the mod-alerts channel.",
-            ephemeral=True
+            f"🚨 **BAN REVIEW NEEDED:** {member.display_name} has hit a 3rd minor violation within the "
+            f"escalation window (Level 2 -> retrigger). Per guild policy this calls for a ban. "
+            f"Latest reason: {reason}\n"
+            f"The bot will NOT ban automatically — a mod needs to review and take action manually.",
+            ephemeral=False
         )
-        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
-        if alert_channel:
-            await alert_channel.send(
-                f"🚨 **BAN REVIEW NEEDED:** {member.display_name} has hit a 3rd minor violation "
-                f"within the escalation window (Level 2 -> retrigger). Per guild policy this calls for a ban. "
-                f"Latest reason: {reason}\n"
-                f"The bot will NOT ban automatically — a mod needs to review and take action manually."
-            )
-        else:
-            print(f"⚠️ Alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post ban-review flag")
 
 
 @bot.tree.command(name="violations", description="[Mod] View a member's minor violation history and current status")
@@ -2011,15 +2039,19 @@ async def clearpurgeflag(interaction: discord.Interaction, member: discord.Membe
         await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
         return
 
+    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
+        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+        return
+
     conn = get_db()
     cursor = conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (member.id,))
     conn.commit()
     conn.close()
 
     if cursor.rowcount > 0:
-        await interaction.response.send_message(f"✅ Purge flag cleared for {member.display_name}.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Purge flag cleared for {member.display_name}.", ephemeral=False)
     else:
-        await interaction.response.send_message(f"{member.display_name} wasn't flagged.", ephemeral=True)
+        await interaction.response.send_message(f"{member.display_name} wasn't flagged.", ephemeral=False)
 
 
 @bot.tree.command(name="foodclubreset", description="[Mod] Clear today's Food Club check and re-run it immediately")

@@ -9,6 +9,7 @@ import aiohttp
 import html
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 # ============================================================
 #  CONFIGURATION — edit these values
@@ -42,6 +43,13 @@ FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's th
 
 BOT_MOD_ROLES = ["Moderator", "Admin", "Coordinator"]   # Role names allowed to use admin commands like /foodclubreset
 
+# --- Weekly bc-entries channel clearing ---
+BC_ENTRIES_CHANNEL = "👑︱bc-entries"  # channel name (no #)
+BC_CLEAR_WEEKDAY = 4       # Monday=0 ... Friday=4 ... Sunday=6
+BC_CLEAR_HOUR = 11         # 24-hour, Pacific time
+BC_CLEAR_MINUTE = 30
+BC_CLEAR_CHECK_INTERVAL_MINUTES = 10  # how often the bot checks whether it's time yet
+
 # --- Activity tracker (mod-only page on the website) ---
 ACTIVITY_SYNC_URL = os.environ.get("ACTIVITY_SYNC_URL", "https://mods.athenaeumarchive.com/activity_sync.php")
 ACTIVITY_SYNC_SECRET = os.environ.get("ACTIVITY_SYNC_SECRET")  # shared secret, set this on Railway
@@ -59,8 +67,9 @@ STRIKE_ALERT_CHANNEL = "🔴︱mod-alerts"  # channel name (no #) where strike/p
 # cooldown. Re-triggered inside THAT window -> flagged for manual ban (bot never
 # bans automatically). If a cooldown fully expires with no re-trigger, the next
 # violation starts fresh back at Level 1.
-MINOR_VIOLATION_LEVEL1_COOLDOWN_DAYS = 30
-MINOR_VIOLATION_LEVEL2_COOLDOWN_DAYS = 90  # ~3 months
+# --- Minor violation escalation (now merged into the unified strike system) ---
+MINOR_VIOLATION_DURATION_DAYS = 30            # first minor violation cooldown
+MINOR_VIOLATION_ESCALATED_DURATION_DAYS = 90  # ~3 months, if re-triggered while still active
 
 # --- Adaptive activity thresholds ---
 # Rather than fixed guessed numbers, the "Really Active" / "Active" cutoffs
@@ -149,17 +158,6 @@ def init_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_strikes_user ON strikes(user_id)")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS minor_violation_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            level INTEGER NOT NULL,
-            reason TEXT NOT NULL,
-            issued_by TEXT NOT NULL,
-            issued_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_minor_violation_user ON minor_violation_log(user_id)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS activity_thresholds (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1194,6 +1192,7 @@ async def on_ready():
     bot.loop.create_task(prune_message_log_loop())
     bot.loop.create_task(threshold_recalc_loop())
     bot.loop.create_task(purge_check_loop())
+    bot.loop.create_task(bc_entries_clear_loop())
 
 
 @bot.event
@@ -1673,6 +1672,23 @@ async def purge_check_loop():
         await asyncio.sleep(PURGE_CHECK_INTERVAL_HOURS * 3600)
 
 
+def get_tracking_window_days() -> float:
+    """How many days of real message_log history actually exist so far,
+    capped at 30. Prevents dividing by a full 30 days before the tracker
+    has actually been running that long, which would make everyone look
+    far less active than they really are in the first few weeks."""
+    conn = get_db()
+    row = conn.execute("SELECT MIN(posted_at) as oldest FROM message_log").fetchone()
+    conn.close()
+
+    if row is None or row["oldest"] is None:
+        return 1 / 24  # no data at all yet — treat as a tiny window, not zero
+
+    oldest = datetime.fromisoformat(row["oldest"])
+    days_tracked = (datetime.now(timezone.utc) - oldest).total_seconds() / 86400
+    return max(min(days_tracked, 30), 1 / 24)
+
+
 def compute_member_activity(user_id: int):
     """Returns (tier, avg_daily_messages, last_seen_iso, last_channel) for one user."""
     conn = get_db()
@@ -1683,7 +1699,8 @@ def compute_member_activity(user_id: int):
         "SELECT COUNT(*) as cnt FROM message_log WHERE user_id = ? AND posted_at >= ?",
         (user_id, window_start)
     ).fetchone()
-    avg_daily = round((row["cnt"] or 0) / 30, 1)
+    tracking_days = get_tracking_window_days()
+    avg_daily = round((row["cnt"] or 0) / tracking_days, 1)
 
     last_row = conn.execute(
         "SELECT channel_name, posted_at FROM message_log WHERE user_id = ? ORDER BY posted_at DESC LIMIT 1",
@@ -1797,7 +1814,7 @@ def get_active_strikes(user_id: int):
     rows = conn.execute("""
         SELECT * FROM strikes
         WHERE user_id = ?
-        AND (strike_type = 'permanent' OR (strike_type = 'temporary' AND expires_at > ?))
+        AND (strike_type = 'permanent' OR (strike_type IN ('temporary', 'minor_violation') AND expires_at > ?))
         ORDER BY issued_at DESC
     """, (user_id, now_iso)).fetchall()
     conn.close()
@@ -1824,10 +1841,11 @@ def get_temp_strike_duration_days(user_id: int) -> int:
 @bot.tree.command(name="strike", description="[Mod] Issue a strike to a member")
 @app_commands.describe(
     member="Who this strike is for",
-    strike_type="Temporary strikes fade automatically; permanent ones don't",
+    strike_type="Minor violations and temporary strikes both fade automatically; permanent ones don't",
     reason="What happened",
 )
 @app_commands.choices(strike_type=[
+    app_commands.Choice(name="Minor Violation (30 days, or 90 if they already have one active)", value="minor_violation"),
     app_commands.Choice(name="Temporary (45 days, or 90 if they already have one active)", value="temporary"),
     app_commands.Choice(name="Permanent", value="permanent"),
 ])
@@ -1842,9 +1860,17 @@ async def strike(interaction: discord.Interaction, member: discord.Member, strik
 
     now = datetime.now(timezone.utc)
     escalated = False
-    if strike_type.value == "temporary":
+    escalated_duration = None
+
+    if strike_type.value == "minor_violation":
+        duration_days = get_minor_violation_duration_days(member.id)
+        escalated = duration_days == MINOR_VIOLATION_ESCALATED_DURATION_DAYS
+        escalated_duration = MINOR_VIOLATION_ESCALATED_DURATION_DAYS
+        expires_at = (now + timedelta(days=duration_days)).isoformat()
+    elif strike_type.value == "temporary":
         duration_days = get_temp_strike_duration_days(member.id)
         escalated = duration_days == TEMP_STRIKE_ESCALATED_DURATION_DAYS
+        escalated_duration = TEMP_STRIKE_ESCALATED_DURATION_DAYS
         expires_at = (now + timedelta(days=duration_days)).isoformat()
     else:
         expires_at = None
@@ -1861,14 +1887,14 @@ async def strike(interaction: discord.Interaction, member: discord.Member, strik
 
     escalation_note = ""
     if escalated:
-        escalation_note = f"\n📈 This escalated to a **{TEMP_STRIKE_ESCALATED_DURATION_DAYS}-day** cooldown since they still had an active temporary strike."
+        escalation_note = f"\n📈 This escalated to a **{escalated_duration}-day** cooldown since they still had an active one of this type."
 
     threshold_note = ""
     if len(active) >= STRIKE_ALERT_THRESHOLD:
         threshold_note = "\n⚠️ Might be time for a serious conversation with them."
 
     await interaction.response.send_message(
-        f"✅ {strike_type.name} strike issued to {member.display_name}. They now have **{len(active)}** active strike(s).{escalation_note}{threshold_note}",
+        f"✅ {strike_type.name} strike issued to {member.display_name}. They now have **{len(active)}** active strike(s) total.{escalation_note}{threshold_note}",
         ephemeral=False
     )
 
@@ -1892,7 +1918,12 @@ async def strikes(interaction: discord.Interaction, member: discord.Member):
 
     lines = [f"**Active strikes for {member.display_name}:**"]
     for s in active:
-        type_label = f"Temporary (fades {s['expires_at'][:10]})" if s["strike_type"] == "temporary" else "Permanent"
+        if s["strike_type"] == "minor_violation":
+            type_label = f"Minor Violation (fades {s['expires_at'][:10]})"
+        elif s["strike_type"] == "temporary":
+            type_label = f"Temporary (fades {s['expires_at'][:10]})"
+        else:
+            type_label = "Permanent"
         lines.append(f"`#{s['id']}` — **{type_label}** — {s['reason']} — issued by {s['issued_by']} on {s['issued_at'][:10]}")
 
     await interaction.response.send_message("\n".join(lines), ephemeral=False)
@@ -1935,113 +1966,25 @@ async def removestrike_autocomplete(interaction: discord.Interaction, current: s
 
 
 # ============================================================
-#  MINOR VIOLATION ESCALATION LADDER
-#  Level 1 (30 day CD) -> retrigger inside window -> Level 2 (90 day CD)
-#  -> retrigger inside window -> flagged for manual ban (never auto-banned).
-#  A fully-expired cooldown with no retrigger resets back to Level 1.
+#  MINOR VIOLATION DURATION — now just a third strike type, using the
+#  same escalating-duration pattern as temporary strikes. Everything
+#  (minor violations, temporary strikes, permanent strikes) shares ONE
+#  count and ONE alert threshold via get_active_strikes().
 # ============================================================
 
-def get_next_violation_level(user_id: int) -> int:
+def get_minor_violation_duration_days(user_id: int) -> int:
+    """30 days normally. If the member already has an active minor
+    violation strike, this one escalates to 90 days instead."""
     conn = get_db()
-    row = conn.execute(
-        "SELECT level, issued_at FROM minor_violation_log WHERE user_id = ? ORDER BY issued_at DESC LIMIT 1",
-        (user_id,)
-    ).fetchone()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    row = conn.execute("""
+        SELECT 1 FROM strikes
+        WHERE user_id = ? AND strike_type = 'minor_violation' AND expires_at > ?
+        LIMIT 1
+    """, (user_id, now_iso)).fetchone()
     conn.close()
 
-    if row is None:
-        return 1
-
-    # Already flagged for a ban that hasn't happened yet — keep re-flagging,
-    # there's no level beyond this.
-    if row["level"] >= 3:
-        return 3
-
-    cooldown_days = MINOR_VIOLATION_LEVEL1_COOLDOWN_DAYS if row["level"] == 1 else MINOR_VIOLATION_LEVEL2_COOLDOWN_DAYS
-    issued_at = datetime.fromisoformat(row["issued_at"])
-    cooldown_expired = datetime.now(timezone.utc) > issued_at + timedelta(days=cooldown_days)
-
-    if cooldown_expired:
-        return 1  # clean slate
-    return row["level"] + 1  # escalate
-
-
-@bot.tree.command(name="minorviolation", description="[Mod] Log a minor rule violation (escalates automatically on repeat offenses)")
-@app_commands.describe(member="Who this is for", reason="What happened")
-async def minorviolation(interaction: discord.Interaction, member: discord.Member, reason: str):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
-        return
-
-    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
-        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
-        return
-
-    new_level = get_next_violation_level(member.id)
-    now = datetime.now(timezone.utc)
-
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO minor_violation_log (user_id, level, reason, issued_by, issued_at) VALUES (?, ?, ?, ?, ?)",
-        (member.id, new_level, reason, str(interaction.user), now.isoformat())
-    )
-    conn.commit()
-    conn.close()
-
-    # Responses are public since this command only runs in the mod-alerts
-    # channel to begin with — no need for a separate duplicate alert message.
-    if new_level == 1:
-        await interaction.response.send_message(
-            f"✅ Logged as a **Level 1** minor violation for {member.display_name} (30-day cooldown started).",
-            ephemeral=False
-        )
-    elif new_level == 2:
-        await interaction.response.send_message(
-            f"⚠️ **{member.display_name}** re-offended within the cooldown window — escalated to **Level 2** "
-            f"(90-day cooldown). One more within that window and they'll be flagged for a ban review. "
-            f"Latest reason: {reason}",
-            ephemeral=False
-        )
-    else:  # new_level == 3
-        await interaction.response.send_message(
-            f"🚨 **BAN REVIEW NEEDED:** {member.display_name} has hit a 3rd minor violation within the "
-            f"escalation window (Level 2 -> retrigger). Per guild policy this calls for a ban. "
-            f"Latest reason: {reason}\n"
-            f"The bot will NOT ban automatically — a mod needs to review and take action manually.",
-            ephemeral=False
-        )
-
-
-@bot.tree.command(name="violations", description="[Mod] View a member's minor violation history and current status")
-@app_commands.describe(member="Whose violation history to look up")
-async def violations(interaction: discord.Interaction, member: discord.Member):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
-        return
-
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM minor_violation_log WHERE user_id = ? ORDER BY issued_at DESC LIMIT 10",
-        (member.id,)
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message(f"{member.display_name} has no minor violation history.", ephemeral=True)
-        return
-
-    current_level = get_next_violation_level(member.id)
-    status_note = {
-        1: "Clean slate — no active cooldown (or none yet logged).",
-        2: "Currently at Level 1, inside its 30-day cooldown.",
-        3: "Currently at Level 2 or pending ban review — inside its cooldown, or flagged.",
-    }[current_level] if rows else "No history."
-
-    lines = [f"**Minor violation history for {member.display_name}:**", f"_{status_note}_", ""]
-    for r in rows:
-        lines.append(f"Level {r['level']} — {r['reason']} — by {r['issued_by']} on {r['issued_at'][:10]}")
-
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    return MINOR_VIOLATION_ESCALATED_DURATION_DAYS if row else MINOR_VIOLATION_DURATION_DAYS
 
 
 @bot.tree.command(name="clearpurgeflag", description="[Mod] Dismiss an inactivity purge flag for a member")
@@ -2064,6 +2007,58 @@ async def clearpurgeflag(interaction: discord.Interaction, member: discord.Membe
         await interaction.response.send_message(f"✅ Purge flag cleared for {member.display_name}.", ephemeral=False)
     else:
         await interaction.response.send_message(f"{member.display_name} wasn't flagged.", ephemeral=False)
+
+
+# ============================================================
+#  WEEKLY BC-ENTRIES CLEARING — every Friday 11:30 AM Pacific,
+#  automatically. Uses zoneinfo so it stays correct across
+#  Daylight Saving time changes without needing manual adjustment.
+# ============================================================
+
+async def clear_bc_entries_once():
+    for guild in bot.guilds:
+        channel = discord.utils.get(guild.text_channels, name=BC_ENTRIES_CHANNEL)
+        if not channel:
+            print(f"⚠️ Channel '{BC_ENTRIES_CHANNEL}' not found in {guild.name} — skipping weekly clear")
+            continue
+        try:
+            deleted = await channel.purge(limit=None)
+            print(f"🧹 Cleared {len(deleted)} messages from #{BC_ENTRIES_CHANNEL} in {guild.name}")
+        except discord.Forbidden:
+            print(f"⚠️ Missing permission to clear #{BC_ENTRIES_CHANNEL} in {guild.name} — bot needs Manage Messages there")
+        except Exception as e:
+            print(f"⚠️ Could not clear #{BC_ENTRIES_CHANNEL} in {guild.name}: {e}")
+
+
+async def bc_entries_clear_loop():
+    await bot.wait_until_ready()
+    last_cleared_date = None
+
+    while not bot.is_closed():
+        now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
+        is_target_window = (
+            now_pacific.weekday() == BC_CLEAR_WEEKDAY
+            and now_pacific.hour == BC_CLEAR_HOUR
+            and BC_CLEAR_MINUTE <= now_pacific.minute < BC_CLEAR_MINUTE + BC_CLEAR_CHECK_INTERVAL_MINUTES
+        )
+
+        if is_target_window and last_cleared_date != now_pacific.date():
+            print(f"🧹 Running scheduled weekly clear of #{BC_ENTRIES_CHANNEL}...")
+            await clear_bc_entries_once()
+            last_cleared_date = now_pacific.date()
+
+        await asyncio.sleep(BC_CLEAR_CHECK_INTERVAL_MINUTES * 60)
+
+
+@bot.tree.command(name="clearbcentries", description="[Mod] Manually clear #bc-entries right now (normally runs automatically every Friday)")
+async def clearbcentries(interaction: discord.Interaction):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await clear_bc_entries_once()
+    await interaction.followup.send(f"✅ Cleared #{BC_ENTRIES_CHANNEL}.", ephemeral=True)
 
 
 @bot.tree.command(name="foodclubreset", description="[Mod] Clear today's Food Club check and re-run it immediately")

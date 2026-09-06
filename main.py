@@ -1856,22 +1856,36 @@ async def strikes(interaction: discord.Interaction, member: discord.Member):
     await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
-@bot.tree.command(name="removestrike", description="[Mod] Remove a strike by its ID (see /strikes for IDs)")
-@app_commands.describe(strike_id="The strike ID shown in /strikes")
-async def removestrike(interaction: discord.Interaction, strike_id: int):
+@bot.tree.command(name="removestrike", description="[Mod] Remove a strike from a member")
+@app_commands.describe(member="Whose strike to remove", strike_id="Pick from the suggestions once you've chosen a member")
+async def removestrike(interaction: discord.Interaction, member: discord.Member, strike_id: int):
     if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
         await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
         return
 
     conn = get_db()
-    cursor = conn.execute("DELETE FROM strikes WHERE id = ?", (strike_id,))
+    cursor = conn.execute("DELETE FROM strikes WHERE id = ? AND user_id = ?", (strike_id, member.id))
     conn.commit()
     conn.close()
 
     if cursor.rowcount > 0:
-        await interaction.response.send_message(f"✅ Strike `#{strike_id}` removed.", ephemeral=True)
+        await interaction.response.send_message(f"✅ Strike `#{strike_id}` removed for {member.display_name}.", ephemeral=True)
     else:
-        await interaction.response.send_message(f"⚠️ No strike found with ID `#{strike_id}`.", ephemeral=True)
+        await interaction.response.send_message(f"⚠️ No strike with ID `#{strike_id}` found for {member.display_name}.", ephemeral=True)
+
+
+@removestrike.autocomplete('strike_id')
+async def removestrike_autocomplete(interaction: discord.Interaction, current: str):
+    member = interaction.namespace.member
+    if member is None:
+        return []
+
+    active = get_active_strikes(member.id)
+    choices = []
+    for s in active:
+        label = f"#{s['id']} — {s['reason'][:60]}"
+        choices.append(app_commands.Choice(name=label, value=s['id']))
+    return choices[:25]
 
 
 # ============================================================

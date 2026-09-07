@@ -56,6 +56,12 @@ ACTIVITY_SYNC_SECRET = os.environ.get("ACTIVITY_SYNC_SECRET")  # shared secret, 
 ACTIVITY_SYNC_INTERVAL_HOURS = 1
 MESSAGE_LOG_RETENTION_DAYS = 185  # needs to cover the 180-day threshold baseline window, plus a small buffer
 
+# Since the bot is also in small test servers, member count / cap only
+# makes sense for your actual guild specifically — confirm this matches
+# your real server's name exactly (check the bot's own logs if unsure).
+MAIN_GUILD_NAME = "✿ ━ 𝘈𝘵𝘩𝘦𝘯𝘢𝘦𝘶𝘮"
+MEMBER_CAP = 100
+
 # --- Strike system (Discord-only, mod commands) ---
 TEMP_STRIKE_DURATION_DAYS = 45       # how long a first temporary "bee sting" strike lasts before fading
 TEMP_STRIKE_ESCALATED_DURATION_DAYS = 90  # ~3 months — used if a NEW temp strike lands while a previous one is still active
@@ -92,6 +98,7 @@ PURGE_THRESHOLD_DAYS = 180          # ~6 months of total silence
 PURGE_HIATUS_THRESHOLD_DAYS = 360   # ~12 months if flagged as on hiatus
 PURGE_CHECK_INTERVAL_HOURS = 24
 HIATUS_LIST_URL = os.environ.get("HIATUS_LIST_URL", "https://mods.athenaeumarchive.com/hiatus_list.php")
+REMOVAL_LOG_URL = os.environ.get("REMOVAL_LOG_URL", "https://mods.athenaeumarchive.com/removal_log.php")
 
 # Where the persistent database lives — this should point inside your Railway Volume
 DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
@@ -294,6 +301,7 @@ def db_delete_food_club_status(date_str):
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.bans = True  # needed for on_member_ban to fire (not a privileged intent, no portal toggle needed)
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -1672,6 +1680,63 @@ async def purge_check_loop():
         await asyncio.sleep(PURGE_CHECK_INTERVAL_HOURS * 3600)
 
 
+# ============================================================
+#  MEMBER REMOVALS TRACKER — logs bans and confirmed inactivity
+#  purges to the website immediately as they happen, feeding the
+#  combined Member Removals page.
+# ============================================================
+
+async def log_removal(discord_id: int, display_name: str, removal_type: str, reason: str | None):
+    if not ACTIVITY_SYNC_SECRET:
+        print("⚠️ ACTIVITY_SYNC_SECRET not set — skipping removal log")
+        return
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                REMOVAL_LOG_URL,
+                json={
+                    "discord_id": str(discord_id),
+                    "display_name": display_name,
+                    "removal_type": removal_type,
+                    "reason": reason,
+                },
+                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                pass
+        except Exception as e:
+            print(f"⚠️ Could not log removal ({removal_type}) for {display_name}: {e}")
+
+
+@bot.event
+async def on_member_ban(guild, user):
+    reason = None
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=5):
+            if entry.target and entry.target.id == user.id:
+                reason = entry.reason
+                break
+    except discord.Forbidden:
+        print("⚠️ Missing 'View Audit Log' permission — logging ban without a reason")
+
+    await log_removal(user.id, str(user), "ban", reason or "No reason recorded")
+
+
+@bot.event
+async def on_member_remove(member):
+    # Only log this as a "purge" if they were actually flagged for
+    # inactivity — a normal voluntary departure isn't a purge.
+    conn = get_db()
+    row = conn.execute("SELECT reason FROM purge_flags WHERE user_id = ?", (member.id,)).fetchone()
+    if row:
+        conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (member.id,))
+        conn.commit()
+    conn.close()
+
+    if row:
+        await log_removal(member.id, member.display_name, "purge", row["reason"])
+
+
 def get_tracking_window_days() -> float:
     """How many days of real message_log history actually exist so far,
     capped at 30. Prevents dividing by a full 30 days before the tracker
@@ -1758,18 +1823,24 @@ async def sync_activity_once():
 
         high_threshold, medium_threshold, computed_at = get_current_thresholds()
 
+        payload = {
+            "updates": updates,
+            "thresholds": {
+                "high_threshold": high_threshold,
+                "medium_threshold": medium_threshold,
+                "computed_at": computed_at,
+            },
+        }
+
+        # Member count/cap only makes sense for your actual guild, not the test servers
+        if guild.name == MAIN_GUILD_NAME:
+            payload["total_members"] = len([m for m in guild.members if not m.bot])
+
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(
                     ACTIVITY_SYNC_URL,
-                    json={
-                        "updates": updates,
-                        "thresholds": {
-                            "high_threshold": high_threshold,
-                            "medium_threshold": medium_threshold,
-                            "computed_at": computed_at,
-                        },
-                    },
+                    json=payload,
                     headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
@@ -1777,7 +1848,7 @@ async def sync_activity_once():
                     if 'error' in result:
                         print(f"📊 Activity sync REJECTED by server: {result['error']}")
                     else:
-                        print(f"📊 Activity sync: {result.get('updated', 0)} members updated | sent {len(updates)}, server received {result.get('debug_received_count', '?')}, raw body {result.get('debug_raw_length', '?')} bytes, json_error={result.get('debug_json_error', '?')}")
+                        print(f"📊 Activity sync: {result.get('updated', 0)} members updated")
             except Exception as e:
                 print(f"⚠️ Activity sync failed: {e}")
 
@@ -1803,39 +1874,88 @@ async def prune_message_log_loop():
 
 
 # ============================================================
-#  STRIKE SYSTEM — mod-only, Discord-side only (no website
-#  component, per Sunny's direction). Temporary strikes fade
-#  automatically; permanent ones don't.
+#  STRIKE SYSTEM — strikes now live in the shared website
+#  database, not the bot's local SQLite. This means Discord
+#  commands and the website's own Strikes page always agree.
 # ============================================================
 
-def get_active_strikes(user_id: int):
-    conn = get_db()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    rows = conn.execute("""
-        SELECT * FROM strikes
-        WHERE user_id = ?
-        AND (strike_type = 'permanent' OR (strike_type IN ('temporary', 'minor_violation') AND expires_at > ?))
-        ORDER BY issued_at DESC
-    """, (user_id, now_iso)).fetchall()
-    conn.close()
-    return rows
+STRIKES_GET_URL = os.environ.get("STRIKES_GET_URL", "https://mods.athenaeumarchive.com/strikes_get_active.php")
+STRIKES_ADD_URL = os.environ.get("STRIKES_ADD_URL", "https://mods.athenaeumarchive.com/strikes_add.php")
+STRIKES_REMOVE_URL = os.environ.get("STRIKES_REMOVE_URL", "https://mods.athenaeumarchive.com/strikes_remove.php")
 
 
-def get_temp_strike_duration_days(user_id: int) -> int:
-    """A new temporary strike normally lasts 45 days. But if the member
-    already has a temporary strike that's still active (hasn't faded yet),
-    this one escalates to 90 days instead — same "re-offend before the
-    cooldown ends" logic as the minor violation ladder."""
-    conn = get_db()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    row = conn.execute("""
-        SELECT 1 FROM strikes
-        WHERE user_id = ? AND strike_type = 'temporary' AND expires_at > ?
-        LIMIT 1
-    """, (user_id, now_iso)).fetchone()
-    conn.close()
+async def get_active_strikes(user_id: int) -> list:
+    """Fetches active strikes from the shared website database."""
+    if not ACTIVITY_SYNC_SECRET:
+        print("⚠️ ACTIVITY_SYNC_SECRET not set — can't reach the strikes database")
+        return []
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                STRIKES_GET_URL,
+                json={"discord_id": str(user_id)},
+                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                result = await resp.json()
+                return result.get("strikes", [])
+        except Exception as e:
+            print(f"⚠️ Could not fetch active strikes: {e}")
+            return []
 
-    return TEMP_STRIKE_ESCALATED_DURATION_DAYS if row else TEMP_STRIKE_DURATION_DAYS
+
+async def get_strike_duration_days(user_id: int, strike_type: str) -> int:
+    """Checks the shared strike data to see if this member already has
+    an active strike of this same type — if so, the new one escalates
+    to a longer cooldown instead of the normal starting duration."""
+    active = await get_active_strikes(user_id)
+    has_active_of_type = any(s["strike_type"] == strike_type for s in active)
+
+    if strike_type == "temporary":
+        return TEMP_STRIKE_ESCALATED_DURATION_DAYS if has_active_of_type else TEMP_STRIKE_DURATION_DAYS
+    if strike_type == "minor_violation":
+        return MINOR_VIOLATION_ESCALATED_DURATION_DAYS if has_active_of_type else MINOR_VIOLATION_DURATION_DAYS
+    return 0  # permanent strikes don't expire, no duration needed
+
+
+async def add_strike_remote(user_id: int, strike_type: str, reason: str, issued_by: str, expires_at_iso) -> dict:
+    if not ACTIVITY_SYNC_SECRET:
+        return {"success": False}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                STRIKES_ADD_URL,
+                json={
+                    "discord_id": str(user_id),
+                    "strike_type": strike_type,
+                    "reason": reason,
+                    "issued_by": issued_by,
+                    "expires_at": expires_at_iso,
+                },
+                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                return await resp.json()
+        except Exception as e:
+            print(f"⚠️ Could not add strike: {e}")
+            return {"success": False}
+
+
+async def remove_strike_remote(strike_id: int, user_id: int) -> dict:
+    if not ACTIVITY_SYNC_SECRET:
+        return {"success": False}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                STRIKES_REMOVE_URL,
+                json={"id": strike_id, "discord_id": str(user_id)},
+                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                return await resp.json()
+        except Exception as e:
+            print(f"⚠️ Could not remove strike: {e}")
+            return {"success": False}
 
 
 @bot.tree.command(name="strike", description="[Mod] Issue a strike to a member")
@@ -1862,28 +1982,26 @@ async def strike(interaction: discord.Interaction, member: discord.Member, strik
     escalated = False
     escalated_duration = None
 
-    if strike_type.value == "minor_violation":
-        duration_days = get_minor_violation_duration_days(member.id)
-        escalated = duration_days == MINOR_VIOLATION_ESCALATED_DURATION_DAYS
-        escalated_duration = MINOR_VIOLATION_ESCALATED_DURATION_DAYS
-        expires_at = (now + timedelta(days=duration_days)).isoformat()
-    elif strike_type.value == "temporary":
-        duration_days = get_temp_strike_duration_days(member.id)
-        escalated = duration_days == TEMP_STRIKE_ESCALATED_DURATION_DAYS
-        escalated_duration = TEMP_STRIKE_ESCALATED_DURATION_DAYS
+    if strike_type.value in ("minor_violation", "temporary"):
+        duration_days = await get_strike_duration_days(member.id, strike_type.value)
+        escalated_duration = (
+            MINOR_VIOLATION_ESCALATED_DURATION_DAYS if strike_type.value == "minor_violation"
+            else TEMP_STRIKE_ESCALATED_DURATION_DAYS
+        )
+        escalated = duration_days == escalated_duration
         expires_at = (now + timedelta(days=duration_days)).isoformat()
     else:
         expires_at = None
 
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO strikes (user_id, strike_type, reason, issued_by, issued_at, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (member.id, strike_type.value, reason, str(interaction.user), now.isoformat(), expires_at)
-    )
-    conn.commit()
-    conn.close()
+    result = await add_strike_remote(member.id, strike_type.value, reason, str(interaction.user), expires_at)
+    if not result.get("success"):
+        await interaction.response.send_message(
+            f"⚠️ Couldn't reach the strikes database — the strike was NOT saved. Try again in a moment. ({result.get('error', 'unknown error')})",
+            ephemeral=True
+        )
+        return
 
-    active = get_active_strikes(member.id)
+    active = await get_active_strikes(member.id)
 
     escalation_note = ""
     if escalated:
@@ -1910,7 +2028,7 @@ async def strikes(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
         return
 
-    active = get_active_strikes(member.id)
+    active = await get_active_strikes(member.id)
 
     if not active:
         await interaction.response.send_message(f"{member.display_name} has no active strikes.", ephemeral=False)
@@ -1940,12 +2058,9 @@ async def removestrike(interaction: discord.Interaction, member: discord.Member,
         await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
         return
 
-    conn = get_db()
-    cursor = conn.execute("DELETE FROM strikes WHERE id = ? AND user_id = ?", (strike_id, member.id))
-    conn.commit()
-    conn.close()
+    result = await remove_strike_remote(strike_id, member.id)
 
-    if cursor.rowcount > 0:
+    if result.get("removed"):
         await interaction.response.send_message(f"✅ Strike `#{strike_id}` removed for {member.display_name}.", ephemeral=False)
     else:
         await interaction.response.send_message(f"⚠️ No strike with ID `#{strike_id}` found for {member.display_name}.", ephemeral=False)
@@ -1957,34 +2072,12 @@ async def removestrike_autocomplete(interaction: discord.Interaction, current: s
     if member is None:
         return []
 
-    active = get_active_strikes(member.id)
+    active = await get_active_strikes(member.id)
     choices = []
     for s in active:
         label = f"#{s['id']} — {s['reason'][:60]}"
         choices.append(app_commands.Choice(name=label, value=s['id']))
     return choices[:25]
-
-
-# ============================================================
-#  MINOR VIOLATION DURATION — now just a third strike type, using the
-#  same escalating-duration pattern as temporary strikes. Everything
-#  (minor violations, temporary strikes, permanent strikes) shares ONE
-#  count and ONE alert threshold via get_active_strikes().
-# ============================================================
-
-def get_minor_violation_duration_days(user_id: int) -> int:
-    """30 days normally. If the member already has an active minor
-    violation strike, this one escalates to 90 days instead."""
-    conn = get_db()
-    now_iso = datetime.now(timezone.utc).isoformat()
-    row = conn.execute("""
-        SELECT 1 FROM strikes
-        WHERE user_id = ? AND strike_type = 'minor_violation' AND expires_at > ?
-        LIMIT 1
-    """, (user_id, now_iso)).fetchone()
-    conn.close()
-
-    return MINOR_VIOLATION_ESCALATED_DURATION_DAYS if row else MINOR_VIOLATION_DURATION_DAYS
 
 
 @bot.tree.command(name="clearpurgeflag", description="[Mod] Dismiss an inactivity purge flag for a member")

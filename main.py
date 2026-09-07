@@ -99,6 +99,8 @@ PURGE_HIATUS_THRESHOLD_DAYS = 360   # ~12 months if flagged as on hiatus
 PURGE_CHECK_INTERVAL_HOURS = 24
 HIATUS_LIST_URL = os.environ.get("HIATUS_LIST_URL", "https://mods.athenaeumarchive.com/hiatus_list.php")
 REMOVAL_LOG_URL = os.environ.get("REMOVAL_LOG_URL", "https://mods.athenaeumarchive.com/removal_log.php")
+PENDING_ALERTS_URL = os.environ.get("PENDING_ALERTS_URL", "https://mods.athenaeumarchive.com/pending_alerts_fetch.php")
+PENDING_ALERTS_CHECK_INTERVAL_MINUTES = 3
 
 # Where the persistent database lives — this should point inside your Railway Volume
 DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
@@ -1201,6 +1203,7 @@ async def on_ready():
     bot.loop.create_task(threshold_recalc_loop())
     bot.loop.create_task(purge_check_loop())
     bot.loop.create_task(bc_entries_clear_loop())
+    bot.loop.create_task(pending_alerts_loop())
 
 
 @bot.event
@@ -1735,6 +1738,51 @@ async def on_member_remove(member):
 
     if row:
         await log_removal(member.id, member.display_name, "purge", row["reason"])
+
+
+# ============================================================
+#  PENDING ALERTS — the website can't post to Discord directly (e.g.
+#  a strike added on the site crossing the threshold), so it queues a
+#  message here and the bot checks/posts it every few minutes.
+# ============================================================
+
+async def check_pending_alerts():
+    if not ACTIVITY_SYNC_SECRET:
+        return
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.post(
+                PENDING_ALERTS_URL,
+                json={},
+                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                result = await resp.json()
+        except Exception as e:
+            print(f"⚠️ Could not check pending alerts: {e}")
+            return
+
+    messages = result.get("messages", [])
+    if not messages:
+        return
+
+    for guild in bot.guilds:
+        if guild.name != MAIN_GUILD_NAME:
+            continue
+        alert_channel = discord.utils.get(guild.text_channels, name=STRIKE_ALERT_CHANNEL)
+        if alert_channel:
+            for msg in messages:
+                await alert_channel.send(msg)
+        else:
+            print(f"⚠️ Alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post pending alerts")
+
+
+async def pending_alerts_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        await check_pending_alerts()
+        await asyncio.sleep(PENDING_ALERTS_CHECK_INTERVAL_MINUTES * 60)
 
 
 def get_tracking_window_days() -> float:

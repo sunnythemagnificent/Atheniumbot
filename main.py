@@ -5,6 +5,7 @@ import asyncio
 import os
 import re
 import sqlite3
+import calendar
 import aiohttp
 import html
 import xml.etree.ElementTree as ET
@@ -49,6 +50,13 @@ BC_CLEAR_WEEKDAY = 4       # Monday=0 ... Friday=4 ... Sunday=6
 BC_CLEAR_HOUR = 11         # 24-hour, Pacific time
 BC_CLEAR_MINUTE = 30
 BC_CLEAR_CHECK_INTERVAL_MINUTES = 10  # how often the bot checks whether it's time yet
+
+# --- Birthdays ---
+BIRTHDAY_CHANNEL = "birthdays"
+BIRTHDAY_ROLE_NAME = "🎂"
+BIRTHDAY_CHECK_HOUR = 0     # midnight, Pacific time
+BIRTHDAY_CHECK_MINUTE = 5   # a few minutes past midnight, to avoid exact-midnight edge cases
+BIRTHDAY_CHECK_INTERVAL_MINUTES = 15
 
 # --- Activity tracker (mod-only page on the website) ---
 ACTIVITY_SYNC_URL = os.environ.get("ACTIVITY_SYNC_URL", "https://mods.athenaeumarchive.com/activity_sync.php")
@@ -187,6 +195,15 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             flagged_at TEXT NOT NULL,
             reason TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS birthdays (
+            user_id INTEGER PRIMARY KEY,
+            birth_month INTEGER NOT NULL,
+            birth_day INTEGER NOT NULL,
+            birth_year INTEGER,
+            set_at TEXT NOT NULL
         )
     """)
     conn.commit()
@@ -1204,6 +1221,7 @@ async def on_ready():
     bot.loop.create_task(purge_check_loop())
     bot.loop.create_task(bc_entries_clear_loop())
     bot.loop.create_task(pending_alerts_loop())
+    bot.loop.create_task(birthday_check_loop())
 
 
 @bot.event
@@ -2189,6 +2207,233 @@ async def bc_entries_clear_loop():
             last_cleared_date = now_pacific.date()
 
         await asyncio.sleep(BC_CLEAR_CHECK_INTERVAL_MINUTES * 60)
+
+
+# ============================================================
+#  BIRTHDAYS — members set their birthday once, and every day the
+#  bot checks (at midnight Pacific) who's having one, grants them
+#  the birthday role for the day, announces it, and removes the
+#  role from anyone whose birthday has now passed.
+# ============================================================
+
+def is_valid_birthday_date(month: int, day: int) -> bool:
+    if month < 1 or month > 12:
+        return False
+    days_in_month = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]  # Feb allows 29 (leap years handled separately)
+    return 1 <= day <= days_in_month[month - 1]
+
+
+async def run_birthday_check():
+    now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
+    today_month = now_pacific.month
+    today_day = now_pacific.day
+
+    # Feb 29 birthdays celebrate on Feb 28 in non-leap years
+    is_leap = calendar.isleap(now_pacific.year)
+
+    conn = get_db()
+    rows = conn.execute("SELECT user_id, birth_month, birth_day, birth_year FROM birthdays").fetchall()
+    conn.close()
+
+    todays_birthday_user_ids = set()
+    for row in rows:
+        bmonth, bday = row["birth_month"], row["birth_day"]
+        if bmonth == 2 and bday == 29 and not is_leap:
+            bday = 28  # fallback for non-leap years
+        if bmonth == today_month and bday == today_day:
+            todays_birthday_user_ids.add((row["user_id"], row["birth_year"]))
+
+    for guild in bot.guilds:
+        if guild.name != MAIN_GUILD_NAME:
+            continue
+
+        role = discord.utils.get(guild.roles, name=BIRTHDAY_ROLE_NAME)
+        if not role:
+            print(f"⚠️ Birthday role '{BIRTHDAY_ROLE_NAME}' not found in {guild.name}")
+            continue
+
+        channel = discord.utils.get(guild.text_channels, name=BIRTHDAY_CHANNEL)
+        todays_ids = {uid for uid, _year in todays_birthday_user_ids}
+
+        # Remove the role from anyone who has it but isn't celebrating today
+        for member in list(role.members):
+            if member.id not in todays_ids:
+                try:
+                    await member.remove_roles(role)
+                    print(f"🎂 Removed birthday role from {member.display_name} (birthday over)")
+                except Exception as e:
+                    print(f"⚠️ Could not remove birthday role from {member.display_name}: {e}")
+
+        # Grant the role + announce for anyone celebrating today who doesn't have it yet
+        for user_id, birth_year in todays_birthday_user_ids:
+            member = guild.get_member(user_id)
+            if not member:
+                continue
+            if role not in member.roles:
+                try:
+                    await member.add_roles(role)
+                    print(f"🎂 Gave birthday role to {member.display_name}")
+                except Exception as e:
+                    print(f"⚠️ Could not give birthday role to {member.display_name}: {e}")
+                    continue
+
+                if channel:
+                    age_note = ""
+                    if birth_year:
+                        age = now_pacific.year - birth_year
+                        age_note = f" (turning {age}!)"
+                    await channel.send(f"🎉 It's {member.mention}'s birthday!{age_note} 🎂")
+
+
+async def birthday_check_loop():
+    await bot.wait_until_ready()
+    last_checked_date = None
+
+    while not bot.is_closed():
+        now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
+        is_target_window = (
+            now_pacific.hour == BIRTHDAY_CHECK_HOUR
+            and BIRTHDAY_CHECK_MINUTE <= now_pacific.minute < BIRTHDAY_CHECK_MINUTE + BIRTHDAY_CHECK_INTERVAL_MINUTES
+        )
+
+        if is_target_window and last_checked_date != now_pacific.date():
+            print("🎂 Running daily birthday check...")
+            await run_birthday_check()
+            last_checked_date = now_pacific.date()
+
+        await asyncio.sleep(BIRTHDAY_CHECK_INTERVAL_MINUTES * 60)
+
+
+@bot.tree.command(name="setbirthday", description="Set your birthday (year is optional)")
+@app_commands.describe(
+    month="Month (1-12)",
+    day="Day of the month",
+    year="Optional — only include if you're comfortable sharing it",
+)
+async def setbirthday(interaction: discord.Interaction, month: int, day: int, year: int = None):
+    if not is_valid_birthday_date(month, day):
+        await interaction.response.send_message("⚠️ That's not a valid date — check the month/day and try again.", ephemeral=True)
+        return
+
+    if year is not None and (year < 1900 or year > datetime.now().year):
+        await interaction.response.send_message("⚠️ That year doesn't look right.", ephemeral=True)
+        return
+
+    conn = get_db()
+    conn.execute("""
+        INSERT INTO birthdays (user_id, birth_month, birth_day, birth_year, set_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            birth_month = excluded.birth_month,
+            birth_day = excluded.birth_day,
+            birth_year = excluded.birth_year,
+            set_at = excluded.set_at
+    """, (interaction.user.id, month, day, year, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+
+    date_str = f"{month}/{day}" + (f"/{year}" if year else "")
+    await interaction.response.send_message(f"✅ Birthday set to {date_str}!", ephemeral=True)
+
+
+@bot.tree.command(name="removebirthday", description="Remove your saved birthday")
+async def removebirthday(interaction: discord.Interaction):
+    conn = get_db()
+    cursor = conn.execute("DELETE FROM birthdays WHERE user_id = ?", (interaction.user.id,))
+    conn.commit()
+    conn.close()
+
+    if cursor.rowcount > 0:
+        await interaction.response.send_message("✅ Your birthday has been removed.", ephemeral=True)
+    else:
+        await interaction.response.send_message("You don't have a birthday saved.", ephemeral=True)
+
+
+@bot.tree.command(name="birthdays", description="See the list of upcoming birthdays")
+async def birthdays(interaction: discord.Interaction):
+    conn = get_db()
+    rows = conn.execute("SELECT user_id, birth_month, birth_day FROM birthdays").fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("No birthdays have been added yet.", ephemeral=True)
+        return
+
+    now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
+    today = (now_pacific.month, now_pacific.day)
+
+    def days_until(month, day):
+        # How many days from today until this month/day next occurs (0 if today)
+        this_year_date = (month, day)
+        if this_year_date >= today:
+            target = now_pacific.replace(month=month, day=min(day, 28) if month == 2 else day, year=now_pacific.year)
+        else:
+            target = now_pacific.replace(month=month, day=min(day, 28) if month == 2 else day, year=now_pacific.year + 1)
+        return (target.date() - now_pacific.date()).days
+
+    entries = []
+    for row in rows:
+        member = interaction.guild.get_member(row["user_id"]) if interaction.guild else None
+        name = member.display_name if member else f"User {row['user_id']}"
+        days_away = days_until(row["birth_month"], row["birth_day"])
+        entries.append((days_away, row["birth_month"], row["birth_day"], name))
+
+    entries.sort(key=lambda e: e[0])
+
+    lines = ["**Upcoming Birthdays:**"]
+    for days_away, month, day, name in entries[:25]:
+        when = "Today! 🎉" if days_away == 0 else ("Tomorrow" if days_away == 1 else f"in {days_away} days")
+        lines.append(f"{month}/{day} — {name} ({when})")
+
+    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="birthdaylist", description="See every saved birthday, in calendar order (Jan-Dec)")
+async def birthdaylist(interaction: discord.Interaction):
+    conn = get_db()
+    rows = conn.execute("SELECT user_id, birth_month, birth_day FROM birthdays").fetchall()
+    conn.close()
+
+    if not rows:
+        await interaction.response.send_message("No birthdays have been added yet.", ephemeral=True)
+        return
+
+    month_names = ["January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December"]
+
+    by_month = {m: [] for m in range(1, 13)}
+    for row in rows:
+        member = interaction.guild.get_member(row["user_id"]) if interaction.guild else None
+        name = member.display_name if member else f"User {row['user_id']}"
+        by_month[row["birth_month"]].append((row["birth_day"], name))
+
+    # Build the full text first, grouped by month, sorted by day within each month
+    sections = []
+    for m in range(1, 13):
+        entries = sorted(by_month[m])
+        if not entries:
+            continue
+        section_lines = [f"**{month_names[m - 1]}**"]
+        for day, name in entries:
+            section_lines.append(f"{month_names[m - 1][:3]} {day} — {name}")
+        sections.append("\n".join(section_lines))
+
+    # Split into chunks that fit Discord's message length limit, breaking
+    # between months rather than mid-list — a 70+ member guild can easily
+    # produce more birthdays than fit in one message.
+    chunks = []
+    current = "🎂 **Guild Birthday List**\n\n"
+    for section in sections:
+        if len(current) + len(section) + 2 > 1900:
+            chunks.append(current)
+            current = ""
+        current += section + "\n\n"
+    if current.strip():
+        chunks.append(current)
+
+    await interaction.response.send_message(chunks[0], ephemeral=False)
+    for chunk in chunks[1:]:
+        await interaction.followup.send(chunk, ephemeral=False)
 
 
 @bot.tree.command(name="clearbcentries", description="[Mod] Manually clear #bc-entries right now (normally runs automatically every Friday)")

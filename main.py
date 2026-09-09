@@ -206,6 +206,13 @@ def init_db():
             set_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS birthday_list_message (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
     print(f"💾 Database ready at {DB_PATH}")
@@ -2304,6 +2311,76 @@ async def birthday_check_loop():
         await asyncio.sleep(BIRTHDAY_CHECK_INTERVAL_MINUTES * 60)
 
 
+async def refresh_birthday_list_message():
+    """Rebuilds the persistent birthday list embed and edits it in place —
+    called right after anyone sets or removes their birthday, so the list
+    updates instantly without anyone needing to run a command to see it."""
+    guild = discord.utils.get(bot.guilds, name=MAIN_GUILD_NAME)
+    if not guild:
+        return
+
+    conn = get_db()
+    rows = conn.execute("SELECT user_id, birth_month, birth_day FROM birthdays").fetchall()
+
+    stored = conn.execute("SELECT channel_id, message_id FROM birthday_list_message WHERE id = 1").fetchone()
+    conn.close()
+
+    month_names = ["January", "February", "March", "April", "May", "June",
+                   "July", "August", "September", "October", "November", "December"]
+
+    by_month = {m: [] for m in range(1, 13)}
+    for row in rows:
+        by_month[row["birth_month"]].append((row["birth_day"], row["user_id"]))
+
+    embed = discord.Embed(title="🎂 Guild Birthday List", color=0xD68A4E)
+    has_any = False
+    for m in range(1, 13):
+        entries = sorted(by_month[m])
+        if not entries:
+            continue
+        has_any = True
+        field_lines = [f"{day} — <@{user_id}>" for day, user_id in entries]
+        field_value = "\n".join(field_lines)
+        if len(field_value) > 1024:  # Discord's per-field limit
+            field_value = field_value[:1000] + "\n…(too many to show, see /birthdaylist)"
+        embed.add_field(name=month_names[m - 1], value=field_value, inline=True)
+
+    if not has_any:
+        embed.description = "No birthdays saved yet — add yours with /setbirthday!"
+
+    channel = discord.utils.get(guild.text_channels, name=BIRTHDAY_CHANNEL)
+    if not channel:
+        print(f"⚠️ Birthday channel '{BIRTHDAY_CHANNEL}' not found — can't update the list message")
+        return
+
+    conn = get_db()
+
+    # Try editing the existing message first
+    if stored:
+        try:
+            existing_channel = bot.get_channel(stored["channel_id"]) or await bot.fetch_channel(stored["channel_id"])
+            message = await existing_channel.fetch_message(stored["message_id"])
+            await message.edit(embed=embed)
+            conn.close()
+            return
+        except (discord.NotFound, discord.Forbidden, Exception) as e:
+            print(f"ℹ️ Couldn't edit existing birthday list message ({e}) — posting a fresh one instead")
+
+    # No existing message (or it's gone) — post a new one and remember it
+    new_message = await channel.send(embed=embed)
+    try:
+        await new_message.pin()
+    except Exception as e:
+        print(f"⚠️ Could not pin the birthday list message: {e}")
+
+    conn.execute("""
+        INSERT INTO birthday_list_message (id, channel_id, message_id) VALUES (1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET channel_id = excluded.channel_id, message_id = excluded.message_id
+    """, (channel.id, new_message.id))
+    conn.commit()
+    conn.close()
+
+
 @bot.tree.command(name="setbirthday", description="Set your birthday (year is optional)")
 @app_commands.describe(
     month="Month (1-12)",
@@ -2334,6 +2411,7 @@ async def setbirthday(interaction: discord.Interaction, month: int, day: int, ye
 
     date_str = f"{month}/{day}" + (f"/{year}" if year else "")
     await interaction.response.send_message(f"✅ Birthday set to {date_str}!", ephemeral=True)
+    await refresh_birthday_list_message()
 
 
 @bot.tree.command(name="removebirthday", description="Remove your saved birthday")
@@ -2345,6 +2423,7 @@ async def removebirthday(interaction: discord.Interaction):
 
     if cursor.rowcount > 0:
         await interaction.response.send_message("✅ Your birthday has been removed.", ephemeral=True)
+        await refresh_birthday_list_message()
     else:
         await interaction.response.send_message("You don't have a birthday saved.", ephemeral=True)
 

@@ -441,6 +441,7 @@ class SuggestionModal(discord.ui.Modal, title="Submit a Suggestion"):
 
         posted = await channel.send(content=interaction.user.mention, embed=embed)
         await posted.add_reaction("👍")
+        await posted.add_reaction("👎")
 
         await interaction.response.send_message(
             f"✅ Your suggestion has been posted in #{SUGGESTIONS_CHANNEL}!",

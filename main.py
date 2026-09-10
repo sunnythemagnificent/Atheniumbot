@@ -58,6 +58,9 @@ BIRTHDAY_CHECK_HOUR = 0     # midnight, Pacific time
 BIRTHDAY_CHECK_MINUTE = 5   # a few minutes past midnight, to avoid exact-midnight edge cases
 BIRTHDAY_CHECK_INTERVAL_MINUTES = 15
 
+# --- Suggestions ---
+SUGGESTIONS_CHANNEL = "💡︱suggestions-feedback"
+
 # --- Activity tracker (mod-only page on the website) ---
 ACTIVITY_SYNC_URL = os.environ.get("ACTIVITY_SYNC_URL", "https://mods.athenaeumarchive.com/activity_sync.php")
 ACTIVITY_SYNC_SECRET = os.environ.get("ACTIVITY_SYNC_SECRET")  # shared secret, set this on Railway
@@ -410,6 +413,39 @@ class MatchConfirmView(discord.ui.View):
     @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌")
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.handle_response(interaction, False)
+
+
+class SuggestionModal(discord.ui.Modal, title="Submit a Suggestion"):
+    suggestion_text = discord.ui.TextInput(
+        label="What's your suggestion?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Share an idea for the guild...",
+        max_length=1000,
+        required=True,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        channel = discord.utils.get(interaction.guild.text_channels, name=SUGGESTIONS_CHANNEL)
+        if not channel:
+            await interaction.response.send_message(
+                f"⚠️ Couldn't find the #{SUGGESTIONS_CHANNEL} channel — let a mod know.",
+                ephemeral=True
+            )
+            return
+
+        embed = discord.Embed(description=self.suggestion_text.value, color=0xD68A4E)
+        embed.set_author(
+            name=f"Suggestion from {interaction.user.display_name}",
+            icon_url=interaction.user.display_avatar.url
+        )
+
+        posted = await channel.send(content=interaction.user.mention, embed=embed)
+        await posted.add_reaction("👍")
+
+        await interaction.response.send_message(
+            f"✅ Your suggestion has been posted in #{SUGGESTIONS_CHANNEL}!",
+            ephemeral=True
+        )
 
 
 class StayOrLeaveView(discord.ui.View):
@@ -2513,6 +2549,11 @@ async def birthdaylist(interaction: discord.Interaction):
     await interaction.response.send_message(chunks[0], ephemeral=False)
     for chunk in chunks[1:]:
         await interaction.followup.send(chunk, ephemeral=False)
+
+
+@bot.tree.command(name="suggest", description="Submit a suggestion for the guild")
+async def suggest(interaction: discord.Interaction):
+    await interaction.response.send_modal(SuggestionModal())
 
 
 @bot.tree.command(name="clearbcentries", description="[Mod] Manually clear #bc-entries right now (normally runs automatically every Friday)")

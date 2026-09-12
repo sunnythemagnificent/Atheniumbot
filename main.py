@@ -2229,7 +2229,8 @@ async def backfillactivity(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await interaction.followup.send(
         f"🔍 Scanning up to {PURGE_THRESHOLD_DAYS} days of message history across every channel — "
-        f"this can take several minutes on a busy server. I'll follow up when it's done.",
+        f"this can take several minutes on a busy server, possibly longer than Discord's 15-minute reply "
+        f"window. If you don't see a completion message here, check #{STRIKE_ALERT_CHANNEL} instead.",
         ephemeral=True
     )
 
@@ -2269,13 +2270,32 @@ async def backfillactivity(interaction: discord.Interaction):
     conn.commit()
     conn.close()
 
-    await interaction.followup.send(
+    # Push the freshly-backfilled data to the website right away, rather
+    # than making you wait up to an hour for the next scheduled sync.
+    try:
+        await sync_activity_once()
+    except Exception as e:
+        print(f"⚠️ Could not trigger immediate sync after backfill: {e}")
+
+    completion_msg = (
         f"✅ Backfill complete. Found and filled in real history for **{backfilled}** member(s) "
         f"who had no tracked activity yet. Anyone genuinely not found anywhere in the last "
         f"{PURGE_THRESHOLD_DAYS} days is now correctly eligible for a purge review going forward — "
-        f"nobody gets auto-flagged from this command itself, that still only happens through the normal daily check.",
-        ephemeral=True
+        f"nobody gets auto-flagged from this command itself, that still only happens through the normal daily check. "
+        f"The website's Member Activity page has also been refreshed with this data."
     )
+
+    # Discord's interaction reply window only lasts 15 minutes — a scan
+    # this long can easily outlast that, so post to a real channel instead
+    # of relying on the (possibly expired) interaction followup.
+    try:
+        await interaction.followup.send(completion_msg, ephemeral=True)
+    except Exception:
+        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
+        if alert_channel:
+            await alert_channel.send(f"{interaction.user.mention} {completion_msg}")
+        else:
+            print(f"⚠️ Backfill finished but couldn't notify anyone — interaction expired and no alert channel found. {completion_msg}")
 
 
 @bot.tree.command(name="clearpurgeflag", description="[Mod] Dismiss an inactivity purge flag for a member")

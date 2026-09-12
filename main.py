@@ -1676,6 +1676,18 @@ async def fetch_hiatus_discord_ids() -> set:
             return set()
 
 
+def get_tracking_start_date():
+    """The earliest message_log timestamp — i.e. the moment message
+    tracking actually began. Returns None if no messages have ever
+    been logged yet."""
+    conn = get_db()
+    row = conn.execute("SELECT MIN(posted_at) as oldest FROM message_log").fetchone()
+    conn.close()
+    if row is None or row["oldest"] is None:
+        return None
+    return datetime.fromisoformat(row["oldest"])
+
+
 async def run_purge_check():
     if not ACTIVITY_SYNC_SECRET:
         print("⚠️ ACTIVITY_SYNC_SECRET not set — skipping purge check")
@@ -1683,6 +1695,7 @@ async def run_purge_check():
 
     hiatus_ids = await fetch_hiatus_discord_ids()
     now = datetime.now(timezone.utc)
+    tracking_start = get_tracking_start_date()
     conn = get_db()
 
     for guild in bot.guilds:
@@ -1706,10 +1719,27 @@ async def run_purge_check():
 
             if row:
                 last_activity = datetime.fromisoformat(row["last_seen_at"])
+            elif tracking_start is None:
+                # No message tracking data exists at all yet anywhere —
+                # can't make a reliable call for anyone, skip entirely.
+                continue
+            elif member.joined_at and member.joined_at > tracking_start:
+                # They joined AFTER tracking began and still have never
+                # posted — join date is a genuinely reliable reference here.
+                last_activity = member.joined_at
             else:
-                # Never posted at all since we started tracking — fall back
-                # to their join date as the reference point.
-                last_activity = member.joined_at or now
+                # They were already in the server before tracking began,
+                # and we have no record of them posting since. We can't
+                # know their TRUE last message — it could easily predate
+                # tracking and be much more recent than their join date.
+                # Only treat this as real silence once we've directly
+                # observed a full threshold's worth of time with no
+                # activity from them since tracking started.
+                days_observed = (now - tracking_start).days
+                threshold_days_needed = PURGE_HIATUS_THRESHOLD_DAYS if str(member.id) in hiatus_ids else PURGE_THRESHOLD_DAYS
+                if days_observed < threshold_days_needed:
+                    continue
+                last_activity = tracking_start
 
             on_hiatus = str(member.id) in hiatus_ids
             threshold_days = PURGE_HIATUS_THRESHOLD_DAYS if on_hiatus else PURGE_THRESHOLD_DAYS
@@ -2188,6 +2218,64 @@ async def removestrike_autocomplete(interaction: discord.Interaction, current: s
         label = f"#{s['id']} — {s['reason'][:60]}"
         choices.append(app_commands.Choice(name=label, value=s['id']))
     return choices[:25]
+
+
+@bot.tree.command(name="backfillactivity", description="[Mod] One-time: scan real message history to fill gaps in activity tracking")
+async def backfillactivity(interaction: discord.Interaction):
+    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(
+        f"🔍 Scanning up to {PURGE_THRESHOLD_DAYS} days of message history across every channel — "
+        f"this can take several minutes on a busy server. I'll follow up when it's done.",
+        ephemeral=True
+    )
+
+    guild = interaction.guild
+    cutoff = datetime.now(timezone.utc) - timedelta(days=PURGE_THRESHOLD_DAYS)
+
+    valid_channels = [
+        c for c in guild.text_channels
+        if c.name not in IGNORED_CHANNELS
+        and c.name != GIVEAWAY_CHANNEL
+    ]
+
+    last_post_map = {}
+    for channel in valid_channels:
+        try:
+            async for msg in channel.history(limit=None, after=cutoff, oldest_first=False):
+                if msg.author.bot:
+                    continue
+                existing = last_post_map.get(msg.author.id)
+                if existing is None or msg.created_at > existing[0]:
+                    last_post_map[msg.author.id] = (msg.created_at, channel.name)
+        except Exception as e:
+            print(f"⚠️ Backfill: could not scan #{channel.name}: {e}")
+            continue
+
+    conn = get_db()
+    backfilled = 0
+    for user_id, (last_time, channel_name) in last_post_map.items():
+        existing_row = conn.execute("SELECT 1 FROM member_last_seen WHERE user_id = ?", (user_id,)).fetchone()
+        if existing_row:
+            continue  # already have real tracked data for them, don't overwrite it
+        conn.execute(
+            "INSERT INTO member_last_seen (user_id, last_seen_at) VALUES (?, ?)",
+            (user_id, last_time.isoformat())
+        )
+        backfilled += 1
+    conn.commit()
+    conn.close()
+
+    await interaction.followup.send(
+        f"✅ Backfill complete. Found and filled in real history for **{backfilled}** member(s) "
+        f"who had no tracked activity yet. Anyone genuinely not found anywhere in the last "
+        f"{PURGE_THRESHOLD_DAYS} days is now correctly eligible for a purge review going forward — "
+        f"nobody gets auto-flagged from this command itself, that still only happens through the normal daily check.",
+        ephemeral=True
+    )
 
 
 @bot.tree.command(name="clearpurgeflag", description="[Mod] Dismiss an inactivity purge flag for a member")

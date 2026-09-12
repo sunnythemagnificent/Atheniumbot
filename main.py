@@ -2259,14 +2259,24 @@ async def backfillactivity(interaction: discord.Interaction):
     conn = get_db()
     backfilled = 0
     for user_id, (last_time, channel_name) in last_post_map.items():
-        existing_row = conn.execute("SELECT 1 FROM member_last_seen WHERE user_id = ?", (user_id,)).fetchone()
-        if existing_row:
-            continue  # already have real tracked data for them, don't overwrite it
-        conn.execute(
-            "INSERT INTO member_last_seen (user_id, last_seen_at) VALUES (?, ?)",
-            (user_id, last_time.isoformat())
-        )
-        backfilled += 1
+        # member_last_seen — used by the purge-check system
+        existing_seen = conn.execute("SELECT 1 FROM member_last_seen WHERE user_id = ?", (user_id,)).fetchone()
+        if not existing_seen:
+            conn.execute(
+                "INSERT INTO member_last_seen (user_id, last_seen_at) VALUES (?, ?)",
+                (user_id, last_time.isoformat())
+            )
+            backfilled += 1
+
+        # message_log — this is what the WEBSITE's "Last Seen" column and
+        # tier calculation actually read from. Without this, the purge
+        # system gets fixed but the website display never reflects it.
+        existing_log = conn.execute("SELECT 1 FROM message_log WHERE user_id = ? LIMIT 1", (user_id,)).fetchone()
+        if not existing_log:
+            conn.execute(
+                "INSERT INTO message_log (user_id, channel_name, posted_at) VALUES (?, ?, ?)",
+                (user_id, channel_name, last_time.isoformat())
+            )
     conn.commit()
     conn.close()
 
@@ -2279,10 +2289,11 @@ async def backfillactivity(interaction: discord.Interaction):
 
     completion_msg = (
         f"✅ Backfill complete. Found and filled in real history for **{backfilled}** member(s) "
-        f"who had no tracked activity yet. Anyone genuinely not found anywhere in the last "
-        f"{PURGE_THRESHOLD_DAYS} days is now correctly eligible for a purge review going forward — "
-        f"nobody gets auto-flagged from this command itself, that still only happens through the normal daily check. "
-        f"The website's Member Activity page has also been refreshed with this data."
+        f"who had no tracked activity yet — this now correctly feeds both the purge-check system "
+        f"AND the website's Member Activity display, so both should be accurate now. Anyone "
+        f"genuinely not found anywhere in the last {PURGE_THRESHOLD_DAYS} days is now correctly "
+        f"eligible for a purge review going forward — nobody gets auto-flagged from this command "
+        f"itself, that still only happens through the normal daily check."
     )
 
     # Discord's interaction reply window only lasts 15 minutes — a scan

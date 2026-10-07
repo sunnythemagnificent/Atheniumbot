@@ -11,6 +11,7 @@ import html
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+import points
 
 # ============================================================
 #  CONFIGURATION — edit these values
@@ -1266,6 +1267,7 @@ async def on_ready():
     bot.loop.create_task(bc_entries_clear_loop())
     bot.loop.create_task(pending_alerts_loop())
     bot.loop.create_task(birthday_check_loop())
+    points.start_background(bot)
 
 
 @bot.event
@@ -1322,6 +1324,11 @@ async def on_message(message):
     conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (message.author.id,))
     conn.commit()
     conn.close()
+
+    # --------------------------------------------------------
+    #  EVENT POINTS
+    # --------------------------------------------------------
+    await points.on_message_points(message)
 
     # --------------------------------------------------------
     #  ACTIVE ROLE TRACKING
@@ -2708,4 +2715,11 @@ async def foodclubreset(interaction: discord.Interaction):
 # ============================================================
 
 init_db()
+points.setup(
+    bot, get_db,
+    mod_roles=BOT_MOD_ROLES,
+    main_guild_name=MAIN_GUILD_NAME,
+    excluded_channels=IGNORED_CHANNELS + [GIVEAWAY_CHANNEL, BC_ENTRIES_CHANNEL, STRIKE_ALERT_CHANNEL],
+    request_channel_name=STRIKE_ALERT_CHANNEL,
+)
 bot.run(BOT_TOKEN)

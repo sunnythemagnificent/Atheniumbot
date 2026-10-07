@@ -46,7 +46,7 @@ from discord import app_commands
 
 # The main server's name is added automatically. Add the exact name of any test
 # server here if you want to try the points system there too.
-POINTS_GUILD_NAMES_EXTRA = []
+POINTS_GUILD_NAMES_EXTRA = ["Bot Testing Playground"]
 
 # Channel NAME where event announcements are posted (no # symbol). If None, the
 # announcement goes in whichever channel the mod ran /event start in (or the

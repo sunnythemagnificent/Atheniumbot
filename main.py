@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import points
+import calendar_sync                     
 
 # ============================================================
 #  CONFIGURATION — edit these values
@@ -1268,6 +1269,7 @@ async def on_ready():
     bot.loop.create_task(pending_alerts_loop())
     bot.loop.create_task(birthday_check_loop())
     points.start_background(bot)
+    calendar_sync.start_background(bot, get_db, MAIN_GUILD_NAME) 
 
 
 @bot.event

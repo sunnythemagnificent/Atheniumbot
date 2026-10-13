@@ -20,6 +20,9 @@ HOW IT WORKS
   A redemption posts a request in the mod channel with Fulfill / Deny buttons.
   Prizes in Neopets are delivered by hand by a mod. Deny refunds automatically.
 - A prize can optionally be a Discord role, which is granted instantly.
+- /massaward gives the same bonus points to many people at once (everyone with a role,
+  a pasted list of @mentions, and/or everyone who reacted to a message). It shows a
+  preview first, and /undomassaward can take a batch back if it was a mistake.
 - Each event can limit where points are earned to specific channels or categories
   (picked from a dropdown right after /event start, or later with /event channels).
   With nothing picked, points are earned in every channel except the usual exclusions.
@@ -32,6 +35,7 @@ HOOKS NEEDED IN main.py (4 small edits):
 """
 
 import asyncio
+import re
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -46,7 +50,7 @@ from discord import app_commands
 
 # The main server's name is added automatically. Add the exact name of any test
 # server here if you want to try the points system there too.
-POINTS_GUILD_NAMES_EXTRA = ["Bot Testing Playground"]
+POINTS_GUILD_NAMES_EXTRA = []
 
 # Channel NAME where event announcements are posted (no # symbol). If None, the
 # announcement goes in whichever channel the mod ran /event start in (or the
@@ -64,6 +68,9 @@ DEFAULT_SHOP_DAYS = 3                  # days the shop stays open after earning 
 POINTS_PUBLIC_AWARDS = True            # True = /awardpoints is announced in the channel it's used in
 POINTS_ALLOW_SELF_AWARD = False        # False = mods can't award points to themselves
 MAX_AWARD = 10000                      # biggest single /awardpoints or /removepoints
+MAX_MASS_AWARD_EACH = 1000             # most points one /massaward can give each person
+MAX_MASS_RECIPIENTS = 200              # most people one /massaward can reach (narrow it down if you hit this)
+MAX_REACTION_SCAN = 500                # most reactions /massaward will read from a message
 
 POINTS_LOOP_SECONDS = 60               # how often the bot checks event phases
 CLOSE_REMINDER_HOURS = 24              # "last call" reminder this long before the shop closes
@@ -212,6 +219,17 @@ def init_tables():
                 request_message_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS idx_pt_red_msg ON pt_redemptions(request_message_id);
+            CREATE TABLE IF NOT EXISTS pt_award_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                recipient_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                undone_at TEXT,
+                undone_by INTEGER
+            );
             CREATE TABLE IF NOT EXISTS pt_event_channels (
                 event_id INTEGER NOT NULL,
                 channel_id INTEGER NOT NULL,
@@ -617,6 +635,87 @@ def _set_request_ref(red_id, guild_id, channel_id, message_id):
             (guild_id, channel_id, message_id, red_id)
         )
         conn.commit()
+
+
+# ============================================================
+#  MASS AWARDS (database side)
+# ============================================================
+
+def create_mass_award(event_id, actor_id, amount, reason, user_ids, now):
+    """Gives `amount` points to every user in user_ids. All-or-nothing: if anything goes
+    wrong part-way, nobody gets anything. The event must still be earning at the moment
+    of writing (it may have ended while the mod was looking at the preview).
+    Returns (True, batch_id) or (False, why)."""
+    with _txn() as conn:
+        row = conn.execute("SELECT * FROM pt_events WHERE id = ?", (event_id,)).fetchone()
+        if not row or event_phase(dict(row), now) != "earning":
+            return (False, "That event isn't earning points any more, so nothing was awarded.")
+        cur = conn.execute(
+            "INSERT INTO pt_award_batches (event_id, created_by, amount, reason, recipient_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (event_id, actor_id, amount, reason, len(user_ids), _iso(now))
+        )
+        batch_id = cur.lastrowid
+        for user_id in user_ids:
+            _add_ledger(conn, event_id, user_id, amount, "award", reason, actor_id, now, batch_id)
+        return (True, batch_id)
+
+
+def get_batch(batch_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM pt_award_batches WHERE id = ?", (batch_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def undo_mass_award(batch_id, actor_id, now):
+    """Takes a mass award back. Nobody is ever pushed below zero: if someone has already
+    spent some of it, only what they still hold is taken. Returns (True, 'ok', stats)
+    or (False, reason, None)."""
+    with _txn() as conn:
+        batch = conn.execute("SELECT * FROM pt_award_batches WHERE id = ?", (batch_id,)).fetchone()
+        if not batch:
+            return (False, "I can't find that batch.", None)
+        if batch["undone_at"]:
+            return (False, "That batch was already undone.", None)
+        evrow = conn.execute("SELECT * FROM pt_events WHERE id = ?", (batch["event_id"],)).fetchone()
+        if not evrow or event_phase(dict(evrow), now) not in ("earning", "shop"):
+            return (False, "That event's shop has closed and its points have expired, so there's nothing to take back.", None)
+
+        rows = conn.execute(
+            "SELECT user_id, SUM(amount) AS given FROM pt_ledger WHERE kind = 'award' AND ref_id = ? GROUP BY user_id",
+            (batch_id,)
+        ).fetchall()
+        awarded_total = recovered = short_members = 0
+        for r in rows:
+            awarded_total += r["given"]
+            holding = max(_balance(conn, batch["event_id"], r["user_id"]), 0)
+            take = min(r["given"], holding)
+            if take > 0:
+                _add_ledger(conn, batch["event_id"], r["user_id"], -take, "remove",
+                            f"Undo mass award #{batch_id}", actor_id, now, batch_id)
+            recovered += take
+            if take < r["given"]:
+                short_members += 1
+        conn.execute("UPDATE pt_award_batches SET undone_at = ?, undone_by = ? WHERE id = ?",
+                     (_iso(now), actor_id, batch_id))
+        return (True, "ok", {
+            "members": len(rows),
+            "awarded_total": awarded_total,
+            "recovered": recovered,
+            "unrecovered": awarded_total - recovered,
+            "short_members": short_members,
+            "event_name": evrow["name"],
+        })
+
+
+def recent_batches(limit=25):
+    """Mass awards that can still be undone, newest first."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT b.*, e.name AS event_name FROM pt_award_batches b JOIN pt_events e ON e.id = b.event_id "
+            "WHERE b.undone_at IS NULL ORDER BY b.id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ============================================================
@@ -1293,6 +1392,248 @@ async def removepoints_cmd(interaction: discord.Interaction, member: discord.Mem
     )
 
 
+# ============================================================
+#  MOD COMMANDS: mass awards
+# ============================================================
+
+# A member @mention, or a bare numeric Discord ID. Role (<@&...>) and channel (<#...>) mentions are ignored.
+_MEMBER_ID_RE = re.compile(r"<@!?(\d{15,25})>|(?<![\d<@!&#])(\d{17,20})(?!\d)")
+_MESSAGE_LINK_RE = re.compile(r"discord(?:app)?\.com/channels/(\d+)/(\d+)/(\d+)")
+
+
+def parse_member_ids(text):
+    """Pulls member IDs out of pasted text: @mentions or bare IDs. Order kept, no repeats."""
+    seen, out = set(), []
+    for match in _MEMBER_ID_RE.finditer(text or ""):
+        uid = int(match.group(1) or match.group(2))
+        if uid not in seen:
+            seen.add(uid)
+            out.append(uid)
+    return out
+
+
+async def _collect_recipients(interaction, role, members_text, reacted_to):
+    """Works out who a /massaward is for. Returns (recipients, notes, error).
+    recipients is a list of Members sorted by name; error is a message or None."""
+    guild = interaction.guild
+    found = {}
+    not_in_server = 0
+
+    if role is not None:
+        for m in role.members:
+            found[m.id] = m
+
+    if members_text:
+        for uid in parse_member_ids(members_text):
+            m = guild.get_member(uid)
+            if m is None:
+                not_in_server += 1
+            else:
+                found[m.id] = m
+
+    if reacted_to:
+        link = _MESSAGE_LINK_RE.search(reacted_to)
+        if not link or int(link.group(1)) != guild.id:
+            return (None, [], "⚠️ `reacted_to` needs a link to a message in this server "
+                              "(right-click the message, then Copy Message Link).")
+        channel = guild.get_channel_or_thread(int(link.group(2)))
+        if channel is None:
+            return (None, [], "⚠️ I can't find the channel that message is in.")
+        try:
+            message = await channel.fetch_message(int(link.group(3)))
+            scanned = 0
+            for reaction in message.reactions:
+                async for user in reaction.users():
+                    scanned += 1
+                    if scanned > MAX_REACTION_SCAN:
+                        break
+                    m = guild.get_member(user.id)
+                    if m is None:
+                        not_in_server += 1
+                    else:
+                        found[m.id] = m
+                if scanned > MAX_REACTION_SCAN:
+                    break
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            return (None, [], "⚠️ I couldn't read that message. Check the link, and that I can see that channel "
+                              "and its message history.")
+
+    notes = []
+    bots = [uid for uid, m in found.items() if m.bot]
+    for uid in bots:
+        del found[uid]
+    if bots:
+        notes.append(f"Skipped {len(bots)} bot account(s).")
+    if not POINTS_ALLOW_SELF_AWARD and interaction.user.id in found:
+        del found[interaction.user.id]
+        notes.append("Skipped you (mods can't award themselves).")
+    if not_in_server:
+        notes.append(f"{not_in_server} ID(s) or reactor(s) weren't found in this server.")
+
+    recipients = sorted(found.values(), key=lambda m: m.display_name.lower())
+    if not recipients:
+        return (None, notes, "⚠️ Nobody to award. " + " ".join(notes))
+    if len(recipients) > MAX_MASS_RECIPIENTS:
+        return (None, notes, f"⚠️ That's {len(recipients)} people, and one batch can reach at most "
+                             f"{MAX_MASS_RECIPIENTS}. Narrow it down, or split it into smaller batches.")
+    return (recipients, notes, None)
+
+
+def _names_text(names, limit=15):
+    shown = ", ".join(discord.utils.escape_mentions(n) for n in names[:limit])
+    return shown + (f" …and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _mass_preview_text(event_name, amount, reason, recipients, notes):
+    n = len(recipients)
+    text = (f"**Give {amount:,} point{'s' if amount != 1 else ''} to each of {n} member{'s' if n != 1 else ''}** "
+            f"in **{event_name}**?\nReason: {reason}\nTotal handed out: **{amount * n:,}** points\n\n"
+            f"{_names_text([m.display_name for m in recipients])}")
+    if notes:
+        text += "\n\n" + "\n".join("• " + note for note in notes)
+    text += "\n\n*Nothing is awarded until you press Confirm. This preview expires in 3 minutes.*"
+    return text
+
+
+class MassAwardConfirmView(discord.ui.View):
+    """The preview a mod sees before a mass award goes through."""
+
+    def __init__(self, user_id, event_id, event_name, amount, reason, recipients):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+        self.event_id = event_id
+        self.event_name = event_name
+        self.amount = amount
+        self.reason = reason
+        self.recipient_ids = [m.id for m in recipients]
+        self.recipient_names = [m.display_name for m in recipients]
+        self.done = False
+
+    async def _authorized(self, interaction):
+        if interaction.user.id != self.user_id or not _is_mod(interaction.user):
+            await interaction.response.send_message("⚠️ This preview belongs to the mod who opened it.", ephemeral=True)
+            return False
+        if self.done:
+            await interaction.response.send_message("That one's already been handled.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success, emoji="✅")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._authorized(interaction):
+            return
+        self.done = True
+        self.stop()
+        try:
+            ok, result = create_mass_award(self.event_id, interaction.user.id, self.amount, self.reason,
+                                           self.recipient_ids, _now())
+        except Exception as e:
+            print(f"⚠️ Points: mass award failed: {e}")
+            ok, result = False, "Something went wrong, so nobody was awarded anything. Please try again."
+        if not ok:
+            await interaction.response.edit_message(content=f"⚠️ {result}", view=None)
+            return
+
+        batch_id, n = result, len(self.recipient_ids)
+        await interaction.response.edit_message(
+            content=(f"✅ Done: **{n}** member{'s' if n != 1 else ''} received **{self.amount:,}** point"
+                     f"{'s' if self.amount != 1 else ''} each (batch **#{batch_id}**).\n"
+                     f"Made a mistake? `/undomassaward` can take this batch back."),
+            view=None
+        )
+        if POINTS_PUBLIC_AWARDS:
+            try:
+                await interaction.channel.send(
+                    content=(f"🎁 **{n}** member{'s' if n != 1 else ''} each received **{self.amount:,}** "
+                             f"point{'s' if self.amount != 1 else ''} in **{self.event_name}** for: {self.reason}\n"
+                             f"{_names_text(self.recipient_names, 25)}  *(batch #{batch_id})*"),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except Exception as e:
+                print(f"⚠️ Points: couldn't post the mass-award announcement: {e}")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._authorized(interaction):
+            return
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled. Nobody received any points.", view=None)
+
+
+@app_commands.command(name="massaward", description="[Mod] Give bonus points to many members at once")
+@app_commands.describe(
+    amount="Points each person gets",
+    reason="What they're being rewarded for",
+    role="Give it to everyone who has this role",
+    members="Paste @mentions (or member IDs) of the people to reward",
+    reacted_to="Link to a message: reward everyone who reacted to it",
+)
+@app_commands.guild_only()
+async def massaward_cmd(interaction: discord.Interaction,
+                        amount: app_commands.Range[int, 1, MAX_MASS_AWARD_EACH],
+                        reason: app_commands.Range[str, 1, 200],
+                        role: Optional[discord.Role] = None,
+                        members: Optional[app_commands.Range[str, 1, 6000]] = None,
+                        reacted_to: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    if role is None and not members and not reacted_to:
+        await interaction.response.send_message(
+            "⚠️ Choose who gets the points: a **role**, a list of **@mentions**, or a **message** to take reactions from. "
+            "You can combine them.", ephemeral=True
+        )
+        return
+    ev = _target_event_for_mod(_now())
+    if not ev:
+        await interaction.response.send_message(
+            "⚠️ No event is earning points right now. Points can only be awarded while an event is running.", ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)   # reading a message's reactions can take a moment
+    recipients, notes, error = await _collect_recipients(interaction, role, members, reacted_to)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
+
+    view = MassAwardConfirmView(interaction.user.id, ev["id"], ev["name"], amount, reason, recipients)
+    await interaction.followup.send(
+        content=_mass_preview_text(ev["name"], amount, reason, recipients, notes), view=view, ephemeral=True
+    )
+
+
+@app_commands.command(name="undomassaward", description="[Mod] Take back a mass award that was a mistake")
+@app_commands.describe(batch="Which mass award to undo")
+@app_commands.guild_only()
+async def undomassaward_cmd(interaction: discord.Interaction, batch: int):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    ok, why, stats = undo_mass_award(batch, interaction.user.id, _now())
+    if not ok:
+        await interaction.response.send_message(f"⚠️ {why}", ephemeral=True)
+        return
+    text = (f"↩️ Mass award **#{batch}** undone in **{stats['event_name']}**: took back "
+            f"**{stats['recovered']:,}** of {stats['awarded_total']:,} points from {stats['members']} member"
+            f"{'s' if stats['members'] != 1 else ''}.")
+    if stats["short_members"]:
+        text += (f"\n{stats['short_members']} member(s) had already spent some of it, so "
+                 f"**{stats['unrecovered']:,}** points couldn't be recovered. Nobody is taken below zero.")
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@undomassaward_cmd.autocomplete("batch")
+async def _ac_undo_batch(interaction: discord.Interaction, current: str):
+    if not _is_mod(interaction.user):
+        return []
+    out = []
+    for b in recent_batches():
+        label = f"#{b['id']} · {b['amount']:,} × {b['recipient_count']} · {b['reason'][:40]} ({b['event_name']})"
+        if current.lower() in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=b["id"]))
+    return out[:25]
+
+
 @app_commands.command(name="redemptions", description="[Mod] List redemption requests still waiting for a mod")
 @app_commands.guild_only()
 async def redemptions_cmd(interaction: discord.Interaction):
@@ -1771,6 +2112,7 @@ def setup(bot, get_db, mod_roles, main_guild_name, excluded_channels, request_ch
     init_tables()
 
     for command in (points_cmd, shop_cmd, redeem_cmd, awardpoints_cmd, removepoints_cmd,
+                    massaward_cmd, undomassaward_cmd,
                     redemptions_cmd, event_group, shopmod_group):
         bot.tree.add_command(command)
     print("🎟️ Points system ready")

@@ -12,7 +12,8 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import points
-import calendar_sync                     
+import calendar_sync   
+import contest
 
 # ============================================================
 #  CONFIGURATION — edit these values
@@ -1269,7 +1270,9 @@ async def on_ready():
     bot.loop.create_task(pending_alerts_loop())
     bot.loop.create_task(birthday_check_loop())
     points.start_background(bot)
+    contest.start_background(bot)
     calendar_sync.start_background(bot, get_db, MAIN_GUILD_NAME) 
+    
 
 
 @bot.event
@@ -2724,4 +2727,5 @@ points.setup(
     excluded_channels=IGNORED_CHANNELS + [GIVEAWAY_CHANNEL, BC_ENTRIES_CHANNEL, STRIKE_ALERT_CHANNEL],
     request_channel_name=STRIKE_ALERT_CHANNEL,
 )
+contest.setup(bot, get_db, BOT_MOD_ROLES, MAIN_GUILD_NAME)
 bot.run(BOT_TOKEN)

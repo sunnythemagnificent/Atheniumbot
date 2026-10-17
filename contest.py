@@ -1,10 +1,11 @@
 """
-contest.py - Secret-ballot voting for guild contests (like the pet costume contest)
+contest.py - Secret-ballot voting for any kind of guild contest (costumes, art, crafts, poetry, ...)
 ===================================================================================
 
 HOW A CONTEST RUNS
-1. A mod creates a contest:        /contest create
-2. A mod adds each entry:          /contest addentry   (pet name + the member who entered it)
+1. A mod creates a contest:        /contest create    (choose the kind: costume, art, craft, poetry, other)
+2. A mod adds each entry:          /contest addentry   (its title + the member who entered it;
+                                                   poems open a pop-up to paste the text into)
 3. A mod opens voting:             /contest open       (posts the entries and a Vote button)
 4. Members vote with the button (or /vote). Each member awards:
        Gold   = 1st choice = 10 points
@@ -26,7 +27,7 @@ Because a ballot can't be traced back to its voter, votes are final: a member
 reviews their ballot, then casts it once.
 
 BIGGER CONTESTS AND SHARING
-- Up to 25 pets: the ballot is three dropdowns. More than that: a paged ballot (medal tabs
+- Up to 25 entries: the ballot is three dropdowns. More than that: a paged ballot (medal tabs
   plus arrows), because Discord dropdowns hold at most 25 choices.
 - The bot can publish a public web gallery of the entries (a page on your website with a
   link you can share anywhere). Only the entries and, once the contest is over, the final top
@@ -87,6 +88,34 @@ PACIFIC = ZoneInfo("America/Los_Angeles")
 
 # (key, medal, name) in order of value
 TIERS = [("gold", "🥇", "Gold"), ("silver", "🥈", "Silver"), ("copper", "🥉", "Copper")]
+
+# CONTEST TYPES. The type sets the words used in messages ("Pick a different poem...") and whether
+# entries are made of text (poems). Everything else (the medals, secret ballots, rules) is the same.
+# To add another type, add a line here and a matching choice on /contest create.
+KINDS = {
+    "costume": {"label": "Costume contest (pets)", "singular": "pet",   "plural": "pets",    "text": False},
+    "art":     {"label": "Art contest",            "singular": "piece", "plural": "pieces",  "text": False},
+    "craft":   {"label": "Craft contest",          "singular": "craft", "plural": "crafts",  "text": False},
+    "poetry":  {"label": "Poetry contest",         "singular": "poem",  "plural": "poems",   "text": True},
+    "other":   {"label": "Other contest",          "singular": "entry", "plural": "entries", "text": False},
+}
+MAX_BODY_CHARS = 4000          # longest text an entry can have (a poem)
+EMBED_TEXT_CHARS = 1500        # how much of a poem is shown in each channel post (the web page shows it all)
+
+
+def plural_of(word):
+    """A simple plural for a custom word ("recipe" -> "recipes", "story" -> "stories")."""
+    w = word.strip()
+    if len(w) > 1 and w.endswith("y") and w[-2].lower() not in "aeiou":
+        return w[:-1] + "ies"
+    if w.lower().endswith(("s", "x", "z", "ch", "sh")):
+        return w + "es"
+    return w + "s"
+
+
+def words(contest):
+    """(singular, plural) for a contest. Contests made before types existed read as pet costume contests."""
+    return (contest.get("entry_singular") or "pet", contest.get("entry_plural") or "pets")
 
 # ============================================================
 #  STATE (filled in by setup())
@@ -175,7 +204,11 @@ def init_tables():
                 results_posted INTEGER NOT NULL DEFAULT 0,
                 results_attempts INTEGER NOT NULL DEFAULT 0,
                 public_page INTEGER NOT NULL DEFAULT 1,
-                web_synced_status TEXT
+                web_synced_status TEXT,
+                kind TEXT NOT NULL DEFAULT 'costume',
+                entry_singular TEXT NOT NULL DEFAULT 'pet',
+                entry_plural TEXT NOT NULL DEFAULT 'pets',
+                text_entries INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS ct_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,6 +218,7 @@ def init_tables():
                 owner_id INTEGER NOT NULL,
                 image_url TEXT,
                 description TEXT,
+                body TEXT,
                 UNIQUE (contest_id, number)
             );
             -- WHO HAS VOTED. No choices here. WITHOUT ROWID stores rows sorted by
@@ -209,6 +243,13 @@ def init_tables():
             conn.execute("ALTER TABLE ct_contests ADD COLUMN public_page INTEGER NOT NULL DEFAULT 1")
         if "web_synced_status" not in cols:
             conn.execute("ALTER TABLE ct_contests ADD COLUMN web_synced_status TEXT")
+        for name, ddl in (("kind", "TEXT NOT NULL DEFAULT 'costume'"), ("entry_singular", "TEXT NOT NULL DEFAULT 'pet'"),
+                          ("entry_plural", "TEXT NOT NULL DEFAULT 'pets'"), ("text_entries", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in cols:
+                conn.execute(f"ALTER TABLE ct_contests ADD COLUMN {name} {ddl}")
+        entry_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ct_entries)").fetchall()}
+        if "body" not in entry_cols:
+            conn.execute("ALTER TABLE ct_entries ADD COLUMN body TEXT")
         conn.commit()
 
 
@@ -241,37 +282,79 @@ def entries_for(contest_id):
     return [dict(r) for r in rows]
 
 
-def create_contest(name, created_by, announce_channel_id, show_owners, now, public_page=True):
+def create_contest(name, created_by, announce_channel_id, show_owners, now, public_page=True,
+                   kind="costume", singular=None, plural=None, text_entries=None):
+    """Makes a contest in setup. The type (kind) fills in the words and whether entries are text;
+    singular / plural / text_entries can override what the type says."""
+    preset = KINDS.get(kind, KINDS["other"])
+    singular = (singular or "").strip() or preset["singular"]
+    plural = (plural or "").strip() or (preset["plural"] if singular == preset["singular"] else plural_of(singular))
+    text_flag = preset["text"] if text_entries is None else bool(text_entries)
     with _db() as conn:
         cur = conn.execute(
             "INSERT INTO ct_contests (name, status, created_by, created_at, announce_channel_id, show_owners, "
-            "gold_pts, silver_pts, copper_pts, public_page) VALUES (?, 'setup', ?, ?, ?, ?, ?, ?, ?, ?)",
+            "gold_pts, silver_pts, copper_pts, public_page, kind, entry_singular, entry_plural, text_entries) "
+            "VALUES (?, 'setup', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, created_by, _iso(now), announce_channel_id, 1 if show_owners else 0,
-             GOLD_POINTS, SILVER_POINTS, COPPER_POINTS, 1 if public_page else 0)
+             GOLD_POINTS, SILVER_POINTS, COPPER_POINTS, 1 if public_page else 0,
+             kind if kind in KINDS else "other", singular[:30], plural[:30], 1 if text_flag else 0)
         )
         conn.commit()
         return cur.lastrowid
 
 
-def add_entry(contest_id, pet_name, owner_id, image_url, description):
-    """Returns (True, entry_number) or (False, reason)."""
+def add_entry(contest_id, title, owner_id, image_url, description, body=None):
+    """Adds an entry. 'title' is the pet's name, the artwork's title, the poem's title, and so on.
+    Contests whose entries are text (poetry) require the text in 'body'; other contests ignore it.
+    Returns (True, entry_number) or (False, reason)."""
     with _txn() as conn:
         c = conn.execute("SELECT * FROM ct_contests WHERE id = ?", (contest_id,)).fetchone()
         if not c:
             return (False, "That contest doesn't exist.")
         if c["status"] != "setup":
             return (False, "Entries can only be added before voting opens.")
-        existing = conn.execute("SELECT number, pet_name FROM ct_entries WHERE contest_id = ?", (contest_id,)).fetchall()
+        one, _many = words(dict(c))
+        body = (body or "").replace("\r\n", "\n").strip()
+        if c["text_entries"]:
+            if not body:
+                return (False, f"This contest's entries are text, so the {one}'s text is needed.")
+            if len(body) > MAX_BODY_CHARS:
+                return (False, f"The text can be at most {MAX_BODY_CHARS:,} characters (yours is {len(body):,}).")
+        else:
+            body = ""
+        existing = conn.execute("SELECT number, pet_name, owner_id FROM ct_entries WHERE contest_id = ?", (contest_id,)).fetchall()
         if len(existing) >= MAX_ENTRIES:
             return (False, f"A contest can have at most {MAX_ENTRIES} entries.")
-        if any(r["pet_name"].strip().lower() == pet_name.strip().lower() for r in existing):
-            return (False, f"There's already an entry called \"{pet_name}\" in this contest.")
+        # the same title from the same person is almost certainly a double entry; two different people can share a title
+        if any(r["pet_name"].strip().lower() == title.strip().lower() and r["owner_id"] == owner_id for r in existing):
+            return (False, f"There's already an entry called \"{title}\" from that member in this contest.")
         number = max([r["number"] for r in existing], default=0) + 1
         conn.execute(
-            "INSERT INTO ct_entries (contest_id, number, pet_name, owner_id, image_url, description) VALUES (?, ?, ?, ?, ?, ?)",
-            (contest_id, number, pet_name.strip(), owner_id, image_url or None, description or None)
+            "INSERT INTO ct_entries (contest_id, number, pet_name, owner_id, image_url, description, body) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (contest_id, number, title.strip(), owner_id, image_url or None, description or None, body or None)
         )
         return (True, number)
+
+
+def set_entry_body(contest_id, number, body):
+    """Replaces an entry's text (before voting opens)."""
+    with _txn() as conn:
+        c = conn.execute("SELECT * FROM ct_contests WHERE id = ?", (contest_id,)).fetchone()
+        if not c:
+            return (False, "That contest doesn't exist.")
+        if c["status"] != "setup":
+            return (False, "Entries can only be changed before voting opens.")
+        if not c["text_entries"]:
+            return (False, "This contest's entries don't have text.")
+        body = (body or "").replace("\r\n", "\n").strip()
+        if not body:
+            return (False, "The text can't be empty.")
+        if len(body) > MAX_BODY_CHARS:
+            return (False, f"The text can be at most {MAX_BODY_CHARS:,} characters (yours is {len(body):,}).")
+        cur = conn.execute("UPDATE ct_entries SET body = ? WHERE contest_id = ? AND number = ?", (body, contest_id, number))
+        if cur.rowcount == 0:
+            return (False, f"There's no entry #{number} in that contest.")
+        return (True, "ok")
 
 
 def remove_entry(contest_id, number):
@@ -356,14 +439,15 @@ def cast_ballot(contest_id, voter_id, picks, now):
         entries = {r["id"]: r for r in conn.execute("SELECT * FROM ct_entries WHERE contest_id = ?", (contest_id,)).fetchall()}
         eligible = [e for e in entries.values() if e["owner_id"] != voter_id]
         need = required_picks(len(eligible))
+        one, _many = words(dict(c))
         if need == 0:
             return (False, "There's nothing for you to vote on in this contest.")
         tiers = [t[0] for t in TIERS][:need]
         if set(picks.keys()) != set(tiers):
-            return (False, f"Please choose a pet for each of the {need} medal{'s' if need != 1 else ''}.")
+            return (False, f"Please choose a {one} for each of the {need} medal{'s' if need != 1 else ''}.")
         ids = [picks[t] for t in tiers]
         if len(set(ids)) != len(ids):
-            return (False, "Each medal has to go to a different pet.")
+            return (False, f"Each medal has to go to a different {one}.")
         for eid in ids:
             entry = entries.get(eid)
             if entry is None:
@@ -505,8 +589,9 @@ def _ballot_intro(contest, required, ends_at, paged=False):
         f"{medal} **{name}**: {contest[f'{key}_pts']} points"
         for key, medal, name in TIERS[:required]
     )
-    how = ("Use the medal tabs and the ◀ ▶ buttons to browse all the pets, and pick a different one for each medal."
-           if paged else "Pick a different pet for each medal.")
+    one, many = words(contest)
+    how = (f"Use the medal tabs and the ◀ ▶ buttons to browse all the {many}, and pick a different one for each medal."
+           if paged else f"Pick a different {one} for each medal.")
     return (
         f"🗳️ **{contest['name']}: your secret ballot**\n"
         f"{how} You can't pick your own entries (they're not in the lists).\n"
@@ -541,7 +626,7 @@ class _BallotBase(discord.ui.View):
             return "⚠️ You still need to choose: " + ", ".join(missing) + "."
         ids = [self.choices[k] for k in keys]
         if len(set(ids)) != len(ids):
-            return "⚠️ Each medal has to go to a different pet. You picked the same one twice."
+            return f"⚠️ Each medal has to go to a different {words(self.contest)[0]}. You picked the same one twice."
         return None
 
     def review_text(self):
@@ -568,7 +653,7 @@ class _BallotBase(discord.ui.View):
 
 
 class BallotView(_BallotBase):
-    """The simple ballot (up to 25 pets): one dropdown per medal."""
+    """The simple ballot (up to 25 entries): one dropdown per medal."""
 
     def __init__(self, contest, eligible, required, voter_id, option_descriptions, choices=None):
         super().__init__(timeout=900)
@@ -619,8 +704,8 @@ class BallotView(_BallotBase):
 
 
 class PagedBallotView(_BallotBase):
-    """The ballot for bigger contests (more than 25 pets). Discord dropdowns hold 25 choices,
-    so this shows one medal at a time (tabs), one page of 25 pets at a time (arrows)."""
+    """The ballot for bigger contests (more than 25 entries). Discord dropdowns hold 25 choices,
+    so this shows one medal at a time (tabs), one page of 25 entries at a time (arrows)."""
 
     def __init__(self, contest, eligible, required, voter_id, option_descriptions, choices=None):
         super().__init__(timeout=900)
@@ -736,7 +821,7 @@ class PagedBallotView(_BallotBase):
             if other_key != key and other_id == entry_id:
                 await interaction.response.send_message(
                     f"⚠️ You already gave #{self._number_of(entry_id)} your {self._tier(other_key)[1]} {self._tier(other_key)[2]} "
-                    f"medal. Each medal has to go to a different pet. Change that one first.", ephemeral=True)
+                    f"medal. Each medal has to go to a different {words(self.contest)[0]}. Change that one first.", ephemeral=True)
                 return
         self.choices[key] = entry_id
         order = [t[0] for t in TIERS[:self.required]]
@@ -865,15 +950,39 @@ class ContestVoteView(discord.ui.View):
 # ============================================================
 
 def _entry_embed(contest, entry, guild):
-    embed = discord.Embed(title=f"#{entry['number']} · {entry['pet_name']}", color=EMBED_COLOR)
+    embed = discord.Embed(title=f"#{entry['number']} · {entry['pet_name']}"[:256], color=EMBED_COLOR)
+    parts = []
     if entry.get("description"):
-        embed.description = entry["description"]
+        parts.append(entry["description"])
+    if entry.get("body"):
+        body = entry["body"]
+        if len(body) > EMBED_TEXT_CHARS:
+            body = body[:EMBED_TEXT_CHARS].rstrip() + "…\n*(the full text is on the web gallery)*"
+        parts.append(body)
+    if parts:
+        embed.description = "\n\n".join(parts)[:4000]
     if contest["show_owners"]:
         embed.add_field(name="Entered by", value=f"<@{entry['owner_id']}>", inline=False)
     if _valid_image_url(entry.get("image_url")):
         embed.set_image(url=entry["image_url"])
     embed.set_footer(text=contest["name"])
     return embed
+
+
+def _embed_batches(embeds, max_per_message=5, max_chars=5500):
+    """Groups embeds into messages. Discord allows at most 10 embeds and about 6000 characters
+    of embed text per message, so long entries (poems) get fewer to a message."""
+    batches, current, size = [], [], 0
+    for e in embeds:
+        n = len(e)
+        if current and (len(current) >= max_per_message or size + n > max_chars):
+            batches.append(current)
+            current, size = [], 0
+        current.append(e)
+        size += n
+    if current:
+        batches.append(current)
+    return batches
 
 
 def _compact_entry_chunks(contest, entries, header):
@@ -981,6 +1090,7 @@ def build_web_payload(contest):
             "owner_name": owner,
             "image_url": e["image_url"] if _valid_image_url(e["image_url"]) else None,
             "description": e["description"],
+            "body": e["body"],
         })
     payload = {
         "contest": {
@@ -992,6 +1102,7 @@ def build_web_payload(contest):
             "closed_at": _parse(contest["closed_at"]).isoformat() if contest["closed_at"] else None,
             "gold_pts": contest["gold_pts"], "silver_pts": contest["silver_pts"], "copper_pts": contest["copper_pts"],
             "ballots": None,
+            "kind": contest["kind"], "entry_singular": contest["entry_singular"], "entry_plural": contest["entry_plural"],
         },
         "entries": entries,
         "results": [],
@@ -1172,43 +1283,94 @@ async def _ac_vote_contest(interaction: discord.Interaction, current: str):
 contest_group = app_commands.Group(name="contest", description="[Mod] Run a voting contest", guild_only=True)
 
 
+def _kind_choices():
+    return [app_commands.Choice(name=v["label"], value=k) for k, v in KINDS.items()]
+
+
 @contest_group.command(name="create", description="[Mod] Start setting up a new contest")
 @app_commands.describe(
     name="What the contest is called",
+    kind="What kind of contest it is (sets the wording, and whether entries are text like poems)",
     announce_channel="Where the entries and results are posted (default: this channel)",
-    show_owners="Show who entered each pet while people vote? (default yes)",
+    show_owners="Show who entered each entry while people vote? (default yes)",
     public_page="Also publish a shareable web gallery of the entries? (default yes)",
+    entry_word="Your own word for an entry, like 'recipe' (only if the kinds above don't fit)",
+    entry_plural="The plural of that word (guessed automatically if you leave it out)",
+    entry_text="Make entries text, like poems? (only needed to override the kind)",
 )
+@app_commands.choices(kind=_kind_choices())
 async def contest_create(interaction: discord.Interaction, name: app_commands.Range[str, 1, 80],
+                         kind: app_commands.Choice[str],
                          announce_channel: Optional[discord.TextChannel] = None, show_owners: bool = True,
-                         public_page: bool = True):
+                         public_page: bool = True, entry_word: Optional[app_commands.Range[str, 1, 30]] = None,
+                         entry_plural: Optional[app_commands.Range[str, 1, 30]] = None,
+                         entry_text: Optional[bool] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
     channel = announce_channel or interaction.channel
-    cid = create_contest(name.strip(), interaction.user.id, getattr(channel, "id", None), show_owners, _now(), public_page)
+    cid = create_contest(name.strip(), interaction.user.id, getattr(channel, "id", None), show_owners, _now(),
+                         public_page, kind.value, entry_word, entry_plural, entry_text)
+    c = get_contest(cid)
+    one, many = words(c)
     gallery_note = ""
     if public_page and web_enabled():
         gallery_note = "\n🖼️ A shareable web gallery will be published when you open voting."
     elif public_page:
         gallery_note = "\n(The web gallery isn't set up on this bot, so entries will be posted in the channel only.)"
+    text_note = f"\n📝 Each {one} is made of text, so you'll paste it into a pop-up form when you add it." if c["text_entries"] else ""
     await interaction.response.send_message(
-        f"✅ Contest **{name.strip()}** created (#{cid}). Entries and results will be posted in "
-        f"{getattr(channel, 'mention', 'this channel')}.{gallery_note}\n"
-        f"Next: add each entry with `/contest addentry`, then start voting with `/contest open`.",
+        f"✅ **{name.strip()}** created (#{cid}), a {KINDS.get(c['kind'], KINDS['other'])['label'].lower()}. "
+        f"Entries are called \"{one}\" / \"{many}\". Entries and results will be posted in "
+        f"{getattr(channel, 'mention', 'this channel')}.{gallery_note}{text_note}\n"
+        f"Next: add each {one} with `/contest addentry`, then start voting with `/contest open`.",
         ephemeral=True
     )
 
 
-@contest_group.command(name="addentry", description="[Mod] Add an entry (a pet and the member who entered it)")
+class EntryTextModal(discord.ui.Modal):
+    """The pop-up where a mod pastes an entry's text (a poem). Used both when adding a text entry and
+    when fixing one later. A pop-up is used because a slash-command box can't hold several lines."""
+
+    def __init__(self, contest, title, entrant=None, image_url=None, description=None, number=None, default=""):
+        one, _many = words(contest)
+        super().__init__(title=(f"Paste the {one}'s text" if number is None else f"Edit the {one}'s text")[:45])
+        self.contest_id = contest["id"]
+        self.entry_title, self.entrant, self.image_url, self.description, self.number = title, entrant, image_url, description, number
+        self.text = discord.ui.TextInput(
+            label=f"The {one}'s text"[:45], style=discord.TextStyle.paragraph, required=True,
+            max_length=MAX_BODY_CHARS, default=(default or None), placeholder="Paste it here, line breaks and all")
+        self.add_item(self.text)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not _is_mod(interaction.user):
+            await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+            return
+        if self.number is None:
+            ok, result = add_entry(self.contest_id, self.entry_title, self.entrant.id, self.image_url, self.description,
+                                   body=self.text.value)
+            if not ok:
+                await interaction.response.send_message(f"⚠️ {result}", ephemeral=True)
+                return
+            total = len(entries_for(self.contest_id))
+            await interaction.response.send_message(
+                f"✅ Added **#{result} · {self.entry_title.strip()}** (entered by {self.entrant.display_name}) with its text. "
+                f"That's {total} entr{'y' if total == 1 else 'ies'} so far.", ephemeral=True)
+        else:
+            ok, result = set_entry_body(self.contest_id, self.number, self.text.value)
+            await interaction.response.send_message(
+                f"✅ Updated the text of #{self.number}." if ok else f"⚠️ {result}", ephemeral=True)
+
+
+@contest_group.command(name="addentry", description="[Mod] Add an entry and the member who entered it")
 @app_commands.describe(
-    pet_name="The pet's name",
-    owner="The member who entered it",
+    title="The entry's name or title (the pet's name, the artwork's title, the poem's title)",
+    entrant="The member who entered it",
     contest="Which contest (default: the one being set up)",
-    image_url="Link to a picture of the pet (a link that doesn't expire; Discord attachments do)",
-    description="Optional note shown with the entry, like the costume details",
+    image_url="Link to a picture (a link that doesn't expire; Discord attachments do)",
+    description="Optional short note shown with the entry, like costume details or the artist's note",
 )
-async def contest_addentry(interaction: discord.Interaction, pet_name: app_commands.Range[str, 1, 80],
-                           owner: discord.Member, contest: Optional[int] = None,
+async def contest_addentry(interaction: discord.Interaction, title: app_commands.Range[str, 1, 80],
+                           entrant: discord.Member, contest: Optional[int] = None,
                            image_url: Optional[str] = None,
                            description: Optional[app_commands.Range[str, 0, 200]] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
@@ -1216,22 +1378,45 @@ async def contest_addentry(interaction: discord.Interaction, pet_name: app_comma
     c = await _resolve_contest(interaction, contest, ("setup",), "being set up")
     if c is None:
         return
-    if owner.bot:
+    if entrant.bot:
         await interaction.response.send_message("⚠️ A bot can't enter the contest.", ephemeral=True)
         return
     image_url = (image_url or "").strip()
     if image_url and not _valid_image_url(image_url):
         await interaction.response.send_message("⚠️ The image link has to be a full web address starting with http:// or https://.", ephemeral=True)
         return
-    ok, result = add_entry(c["id"], pet_name, owner.id, image_url or None, (description or "").strip() or None)
+    note = (description or "").strip() or None
+    if c["text_entries"]:
+        # text entries (poems): collect the text in a pop-up, and add the entry when it's submitted
+        await interaction.response.send_modal(EntryTextModal(c, title, entrant, image_url or None, note))
+        return
+    ok, result = add_entry(c["id"], title, entrant.id, image_url or None, note)
     if not ok:
         await interaction.response.send_message(f"⚠️ {result}", ephemeral=True)
         return
     total = len(entries_for(c["id"]))
     await interaction.response.send_message(
-        f"✅ Added **#{result} · {pet_name.strip()}** (entered by {owner.display_name}) to **{c['name']}**. "
+        f"✅ Added **#{result} · {title.strip()}** (entered by {entrant.display_name}) to **{c['name']}**. "
         f"That's {total} entr{'y' if total == 1 else 'ies'} so far.", ephemeral=True
     )
+
+
+@contest_group.command(name="edittext", description="[Mod] Fix the text of a text entry (like a poem) before voting opens")
+@app_commands.describe(number="The entry's number", contest="Which contest (default: the one being set up)")
+async def contest_edittext(interaction: discord.Interaction, number: int, contest: Optional[int] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    c = await _resolve_contest(interaction, contest, ("setup",), "being set up")
+    if c is None:
+        return
+    if not c["text_entries"]:
+        await interaction.response.send_message("⚠️ This contest's entries don't have text.", ephemeral=True)
+        return
+    entry = next((e for e in entries_for(c["id"]) if e["number"] == number), None)
+    if entry is None:
+        await interaction.response.send_message(f"⚠️ There's no entry #{number} in that contest.", ephemeral=True)
+        return
+    await interaction.response.send_modal(EntryTextModal(c, entry["pet_name"], number=number, default=entry.get("body") or ""))
 
 
 @contest_group.command(name="removeentry", description="[Mod] Remove an entry before voting opens")
@@ -1255,7 +1440,7 @@ async def contest_entries(interaction: discord.Interaction, contest: Optional[in
     if c is None:
         return
     entries = entries_for(c["id"])
-    lines = [f"`#{e['number']}` **{e['pet_name']}** by <@{e['owner_id']}>" + (" 🖼️" if e.get("image_url") else "") for e in entries]
+    lines = [f"`#{e['number']}` **{e['pet_name']}** by <@{e['owner_id']}>" + (" 🖼️" if e.get("image_url") else "") + (" 📝" if e.get("body") else "") for e in entries]
     await interaction.response.send_message(
         f"**{c['name']}** ({_status_label(c['status'])}): {len(entries)} entr{'y' if len(entries) == 1 else 'ies'}\n" +
         ("\n".join(lines) if lines else "*none yet*"), ephemeral=True)
@@ -1300,17 +1485,12 @@ async def contest_open(interaction: discord.Interaction, contest: Optional[int] 
         if len(entries) > GALLERY_EMBED_LIMIT and link:
             # a big contest: one picture card per pet would flood the channel, so post a compact
             # list and point to the web gallery, which shows every picture on one page
-            header = f"📋 **{c['name']}**: {len(entries)} entries. 🖼️ See every pet with its picture here: {link}\n"
+            one, many = words(c)
+            header = f"📋 **{c['name']}**: {len(entries)} {many}. 🖼️ See every {one} here: {link}\n"
             for chunk in _compact_entry_chunks(c, entries, header):
                 await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
         else:
-            batch = []
-            for entry in entries:
-                batch.append(_entry_embed(c, entry, interaction.guild))
-                if len(batch) == 5:
-                    await channel.send(embeds=batch)
-                    batch = []
-            if batch:
+            for batch in _embed_batches([_entry_embed(c, entry, interaction.guild) for entry in entries]):
                 await channel.send(embeds=batch)
         message = await channel.send(embed=_vote_post_embed(c, _iso(ends_at), link), view=ContestVoteView())
     except Exception as e:
@@ -1421,7 +1601,7 @@ async def contest_status(interaction: discord.Interaction, contest: Optional[int
     c = await _resolve_contest(interaction, contest, ("setup", "voting", "closed"), "running")
     if c is None:
         return
-    text = (f"**{c['name']}**: {_status_label(c['status'])}\n"
+    text = (f"**{c['name']}**: {_status_label(c['status'])} · {KINDS.get(c['kind'], KINDS['other'])['label']}\n"
             f"Entries: {len(entries_for(c['id']))}\n")
     if c["status"] in ("voting", "closed"):
         text += f"Ballots cast: {ballots_cast(c['id'])}\n"
@@ -1461,6 +1641,11 @@ async def _ac_addentry(interaction: discord.Interaction, current: str):
 
 @contest_removeentry.autocomplete("contest")
 async def _ac_removeentry(interaction: discord.Interaction, current: str):
+    return await _contest_choices(interaction, current, ("setup",))
+
+
+@contest_edittext.autocomplete("contest")
+async def _ac_edittext(interaction: discord.Interaction, current: str):
     return await _contest_choices(interaction, current, ("setup",))
 
 

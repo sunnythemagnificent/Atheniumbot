@@ -99,6 +99,7 @@ KINDS = {
     "poetry":  {"label": "Poetry contest",         "singular": "poem",  "plural": "poems",   "text": True},
     "other":   {"label": "Other contest",          "singular": "entry", "plural": "entries", "text": False},
 }
+MAX_EXTEND_DAYS = 90          # a deadline can't be pushed further than this from now
 MAX_BODY_CHARS = 4000          # longest text an entry can have (a poem)
 EMBED_TEXT_CHARS = 1500        # how much of a poem is shown in each channel post (the web page shows it all)
 
@@ -208,7 +209,8 @@ def init_tables():
                 kind TEXT NOT NULL DEFAULT 'costume',
                 entry_singular TEXT NOT NULL DEFAULT 'pet',
                 entry_plural TEXT NOT NULL DEFAULT 'pets',
-                text_entries INTEGER NOT NULL DEFAULT 0
+                text_entries INTEGER NOT NULL DEFAULT 0,
+                results_message_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS ct_entries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -247,6 +249,8 @@ def init_tables():
                           ("entry_plural", "TEXT NOT NULL DEFAULT 'pets'"), ("text_entries", "INTEGER NOT NULL DEFAULT 0")):
             if name not in cols:
                 conn.execute(f"ALTER TABLE ct_contests ADD COLUMN {name} {ddl}")
+        if "results_message_id" not in cols:
+            conn.execute("ALTER TABLE ct_contests ADD COLUMN results_message_id INTEGER")
         entry_cols = {r["name"] for r in conn.execute("PRAGMA table_info(ct_entries)").fetchall()}
         if "body" not in entry_cols:
             conn.execute("ALTER TABLE ct_entries ADD COLUMN body TEXT")
@@ -392,6 +396,34 @@ def close_contest(contest_id, now):
             return (False, "That contest isn't taking votes.")
         conn.execute("UPDATE ct_contests SET status = 'closed', closed_at = ? WHERE id = ?", (_iso(now), contest_id))
         return (True, "ok")
+
+
+def extend_contest(contest_id, new_end, now):
+    """Gives a contest more voting time. A contest that's still taking votes just gets a later deadline;
+    one that already closed is REOPENED (its results are cleared, the ballots already cast are kept).
+    Returns (True, info) or (False, reason)."""
+    with _txn() as conn:
+        c = conn.execute("SELECT * FROM ct_contests WHERE id = ?", (contest_id,)).fetchone()
+        if not c:
+            return (False, "That contest doesn't exist.")
+        if c["status"] not in ("voting", "closed"):
+            return (False, "Only a contest that's taking votes, or one that has closed, can be extended.")
+        if new_end > now + timedelta(days=MAX_EXTEND_DAYS):
+            return (False, f"A deadline can't be more than {MAX_EXTEND_DAYS} days away.")
+        info = {"was": c["status"], "old_end": c["voting_ends_at"], "results_message_id": c["results_message_id"]}
+        if c["status"] == "voting":
+            if new_end <= _parse(c["voting_ends_at"]):
+                return (False, f"The new deadline has to be later than the current one ({_ts(c['voting_ends_at'])}).")
+            conn.execute("UPDATE ct_contests SET voting_ends_at = ?, web_synced_status = NULL WHERE id = ?",
+                         (_iso(new_end), contest_id))
+        else:
+            if new_end <= now + timedelta(minutes=5):
+                return (False, "Reopened voting needs to run for at least a few more minutes.")
+            conn.execute(
+                "UPDATE ct_contests SET status = 'voting', voting_ends_at = ?, closed_at = NULL, results_posted = 0, "
+                "results_attempts = 0, results_message_id = NULL, web_synced_status = NULL WHERE id = ?",
+                (_iso(new_end), contest_id))
+        return (True, info)
 
 
 def cancel_contest(contest_id, now):
@@ -1177,12 +1209,14 @@ async def finish_contest(contest):
     ranked, ballots = get_standings(contest["id"])
     channel = await _get_channel(contest["announce_channel_id"])
     posted = False
+    results_message_id = None
     if channel is None:
         print(f"⚠️ Contest: couldn't find the announcement channel for '{contest['name']}'")
     else:
         try:
-            await channel.send(embed=results_embed(contest, ranked, ballots),
-                               allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+            sent = await channel.send(embed=results_embed(contest, ranked, ballots),
+                                      allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
+            results_message_id = getattr(sent, "id", None)
             posted = True
         except Exception as e:
             print(f"⚠️ Contest: couldn't post results for '{contest['name']}' ({type(e).__name__})")
@@ -1201,8 +1235,9 @@ async def finish_contest(contest):
     with _db() as conn:
         attempts = contest["results_attempts"] + 1
         done = 1 if (posted or attempts >= MAX_RESULT_ATTEMPTS or channel is None) else 0
-        conn.execute("UPDATE ct_contests SET results_posted = ?, results_attempts = ? WHERE id = ?",
-                     (done, attempts, contest["id"]))
+        conn.execute("UPDATE ct_contests SET results_posted = ?, results_attempts = ?, "
+                     "results_message_id = COALESCE(?, results_message_id) WHERE id = ?",
+                     (done, attempts, results_message_id, contest["id"]))
         conn.commit()
     await push_web(contest["id"])        # the web gallery now shows the final results too
     return posted
@@ -1226,6 +1261,57 @@ async def contest_tick(now=None):
         await sync_web_if_needed(now)
     except Exception as e:
         print(f"⚠️ Contest: web gallery sync problem ({type(e).__name__})")
+
+
+async def apply_extension(contest_id, info, reason=None, announce=True):
+    """After extend_contest() has moved the deadline: refresh the vote post, void old results if the
+    contest was reopened, tell the channel, and update the web gallery. Nothing here can fail the extension."""
+    c = get_contest(contest_id)
+    reopened = info["was"] == "closed"
+    link = web_link(c)
+
+    # 1) the vote post shows the new deadline (and gets its button back if the contest had closed)
+    try:
+        vote_channel = await _get_channel(c["vote_channel_id"])
+        if vote_channel is not None and c["vote_message_id"]:
+            msg = await vote_channel.fetch_message(c["vote_message_id"])
+            await msg.edit(embed=_vote_post_embed(c, c["voting_ends_at"], link), view=ContestVoteView())
+    except Exception as e:
+        print(f"⚠️ Contest: couldn't refresh the vote post ({type(e).__name__})")
+
+    # 2) results that were already posted no longer stand
+    if reopened and info.get("results_message_id"):
+        try:
+            results_channel = await _get_channel(c["announce_channel_id"])
+            old = await results_channel.fetch_message(info["results_message_id"])
+            await old.edit(embed=discord.Embed(
+                title=f"⚠️ Void: results for {c['name']}",
+                description="Voting was reopened, so these results no longer stand. New results will be posted when voting ends.",
+                color=EMBED_COLOR))
+        except Exception as e:
+            print(f"⚠️ Contest: couldn't mark the old results as void ({type(e).__name__})")
+
+    # 3) tell the channel
+    if announce:
+        channel = await _get_channel(c["announce_channel_id"])
+        if channel is not None:
+            if reopened:
+                title = f"🔓 Voting has reopened: {c['name']}"
+                body = (f"Voting now ends {_ts(c['voting_ends_at'])} ({_ts(c['voting_ends_at'], 'R')}). "
+                        f"The earlier results are void. Ballots already cast still count, and nobody can vote twice.")
+            else:
+                title = f"⏰ More time to vote: {c['name']}"
+                body = f"Voting now ends {_ts(c['voting_ends_at'])} ({_ts(c['voting_ends_at'], 'R')})."
+            if reason:
+                body += f"\n**Why:** {reason}"
+            body += "\nHaven't voted yet? Press the Vote button on the entries post, or use `/vote`."
+            try:
+                await channel.send(embed=discord.Embed(title=title, description=body, color=EMBED_COLOR))
+            except Exception as e:
+                print(f"⚠️ Contest: couldn't post the extension notice ({type(e).__name__})")
+
+    # 4) the web gallery shows the new deadline (and drops any results)
+    await push_web(contest_id)
 
 
 async def contest_loop():
@@ -1540,6 +1626,79 @@ class _ConfirmView(discord.ui.View):
         self.used = True
         self.stop()
         await interaction.response.edit_message(content="Okay, nothing changed.", view=None)
+
+
+@contest_group.command(name="extend", description="[Mod] Give a contest more voting time (or reopen one that has closed)")
+@app_commands.describe(
+    contest="Which contest (default: the one taking votes). To reopen a finished one, choose it here",
+    hours="Add this many hours to the deadline (a reopened contest counts from now)",
+    until="Or set a new end date as YYYY-MM-DD (voting ends at 11:59 PM Pacific that day)",
+    reason="Optional note shown in the announcement (like 'Discord was down')",
+    announce="Post a notice in the channel? (default yes)",
+)
+async def contest_extend(interaction: discord.Interaction, contest: Optional[int] = None,
+                         hours: Optional[app_commands.Range[int, 1, 720]] = None, until: Optional[str] = None,
+                         reason: Optional[app_commands.Range[str, 0, 200]] = None, announce: bool = True):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    if (hours is None) == (until is None):
+        await interaction.response.send_message("⚠️ Give either `hours` (how much time to add) or `until` (a new end date), not both and not neither.", ephemeral=True)
+        return
+    if contest is None:
+        taking_votes = list_contests(["voting"])
+        if not taking_votes:
+            await interaction.response.send_message(
+                "⚠️ No contest is taking votes right now. To reopen one that finished, pick it in the `contest` option.", ephemeral=True)
+            return
+        if len(taking_votes) > 1:
+            names = ", ".join(f"#{x['id']} {x['name']}" for x in taking_votes[:8])
+            await interaction.response.send_message(f"⚠️ More than one contest is taking votes ({names}). Choose which one in the `contest` option.", ephemeral=True)
+            return
+        c = taking_votes[0]
+    else:
+        c = get_contest(contest)
+        if not c or c["status"] not in ("voting", "closed"):
+            await interaction.response.send_message("⚠️ That contest isn't taking votes and hasn't closed, so it can't be extended.", ephemeral=True)
+            return
+
+    now = _now()
+    if until:
+        try:
+            new_end = datetime.strptime(until.strip(), "%Y-%m-%d").replace(hour=23, minute=59, second=59, tzinfo=PACIFIC).astimezone(timezone.utc)
+        except ValueError:
+            await interaction.response.send_message("⚠️ The end date should look like `2026-11-20`.", ephemeral=True)
+            return
+    else:
+        base = max(_parse(c["voting_ends_at"]), now) if c["status"] == "voting" else now
+        new_end = base + timedelta(hours=hours)
+    reason = (reason or "").strip() or None
+    contest_id = c["id"]
+
+    async def do_it():
+        ok, result = extend_contest(contest_id, new_end, _now())
+        if not ok:
+            return f"⚠️ {result}"
+        await apply_extension(contest_id, result, reason, announce)
+        updated = get_contest(contest_id)
+        return (f"{'🔓 Reopened' if result['was'] == 'closed' else '⏰ Extended'}: **{updated['name']}** now ends "
+                f"{_ts(updated['voting_ends_at'])} ({_ts(updated['voting_ends_at'], 'R')}).")
+
+    if c["status"] == "closed":
+        n = ballots_cast(contest_id)
+        await interaction.response.send_message(
+            f"Reopen voting for **{c['name']}**?\n"
+            f"Its results have **already been posted**, so people have seen the standings and later votes could be influenced. "
+            f"Reopening marks that results post as void and keeps the **{n}** ballot{'s' if n != 1 else ''} already cast "
+            f"(nobody can vote twice). Voting would end {_ts(_iso(new_end))}, and new results are posted then.",
+            view=_ConfirmView(interaction.user.id, do_it, ""), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)           # refreshing the posts takes a moment
+    await interaction.followup.send(await do_it(), ephemeral=True)
+
+
+@contest_extend.autocomplete("contest")
+async def _ac_extend(interaction: discord.Interaction, current: str):
+    return await _contest_choices(interaction, current, ("voting", "closed"))
 
 
 @contest_group.command(name="close", description="[Mod] End voting now and post the results")

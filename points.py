@@ -462,6 +462,55 @@ def close_event_now(event_id, now):
     return (True, "ok")
 
 
+def extend_event(event_id, what, delta, now):
+    """Gives an event more time.
+
+    what == "earning": earning runs longer. If earning hasn't ended yet, the shop is pushed back by the same
+        amount, so it keeps its full window. If earning had already ended, it RESUMES until now + delta and
+        the shop stays open for its normal shop days after that.
+    what == "shop": the shop stays open longer, or reopens if it had already closed. Earning is untouched.
+
+    Nothing is ever deleted when an event closes (spending just stops), so points are all still there.
+    Announcements are re-armed so the end/reminder/close notices fire at the NEW times.
+    Returns (True, info) or (False, reason); reason is "missing", "cancelled" or ("clash", other_event_name)."""
+    with _txn() as conn:
+        row = conn.execute("SELECT * FROM pt_events WHERE id = ?", (event_id,)).fetchone()
+        if not row:
+            return (False, "missing")
+        ev = dict(row)
+        phase = event_phase(ev, now)
+        if phase == "cancelled":
+            return (False, "cancelled")
+        earn_end, shop_close = _parse(ev["earn_end"]), _parse(ev["shop_close"])
+        new_end, new_close = earn_end, shop_close
+        if what == "earning":
+            if phase in ("scheduled", "earning"):
+                new_end, new_close, newly_open_from = earn_end + delta, shop_close + delta, earn_end
+            else:                                           # earning had ended: it resumes now
+                new_end = now + delta
+                new_close = max(shop_close, new_end + timedelta(days=ev["shop_days"]))
+                newly_open_from = now
+            # two events can't be earning at the same time, so the newly added time must be free
+            clash = conn.execute(
+                "SELECT name FROM pt_events WHERE cancelled = 0 AND id != ? AND earn_start < ? AND ? < earn_end",
+                (event_id, _iso(new_end), _iso(newly_open_from))
+            ).fetchone()
+            if clash:
+                return (False, ("clash", clash["name"]))
+        else:
+            new_close = (now if phase == "closed" else shop_close) + delta
+        close_is_near = (new_close - now) <= timedelta(hours=CLOSE_REMINDER_HOURS)
+        conn.execute(
+            "UPDATE pt_events SET earn_end = ?, shop_close = ?, announced_end = ?, reminded_close = ?, announced_close = 0 "
+            "WHERE id = ?",
+            (_iso(new_end), _iso(new_close), 0 if what == "earning" else ev["announced_end"],
+             1 if close_is_near else 0, event_id)
+        )
+    invalidate_cache()
+    return (True, {"phase_before": phase, "old_end": ev["earn_end"], "old_close": ev["shop_close"],
+                   "new_end": _iso(new_end), "new_close": _iso(new_close)})
+
+
 def cancel_event(event_id, now):
     with _txn() as conn:
         row = conn.execute("SELECT * FROM pt_events WHERE id = ?", (event_id,)).fetchone()
@@ -881,6 +930,30 @@ def _close_embed(ev):
         description="Unspent points have expired. Thank you to everyone who took part!",
         color=EMBED_COLOR
     )
+
+
+async def _announce_extension(event_id, what, info, reason):
+    """Tells the announcement channel an event got more time, and refreshes the opening post's dates."""
+    ev = get_event(event_id)
+    if not ev:
+        return
+    await _refresh_open_announcement(event_id)
+    if info["phase_before"] == "scheduled":
+        return                                              # nobody has been told about this event yet
+    resumed = info["phase_before"] in ("shop", "closed")
+    if what == "earning":
+        title = f"⏰ Earning has resumed: {ev['name']}" if resumed else f"⏰ More time to earn: {ev['name']}"
+        body = (f"Points can be earned until **{_ts(ev['earn_end'])}** ({_ts(ev['earn_end'], 'R')}).\n"
+                f"The shop stays open until {_ts(ev['shop_close'])}.")
+    else:
+        title = (f"🔓 The shop has reopened: {ev['name']}" if info["phase_before"] == "closed"
+                 else f"🛍️ The shop stays open longer: {ev['name']}")
+        body = (f"The shop now closes **{_ts(ev['shop_close'])}** ({_ts(ev['shop_close'], 'R')}).\n"
+                f"Use `/points` to check your balance and `/redeem` to claim a prize. "
+                f"**Unspent points expire when the shop closes.**")
+    if reason:
+        body += f"\n**Why:** {reason}"
+    await _announce(ev, discord.Embed(title=title, description=body, color=EMBED_COLOR))
 
 
 def _recap_embed(ev):
@@ -1881,6 +1954,96 @@ async def event_close(interaction: discord.Interaction, event: int):
         return
     await interaction.response.send_message("🔒 The shop is closed and unspent points have expired.", ephemeral=True)
     await run_tick()
+
+
+class _ExtendConfirmView(discord.ui.View):
+    """Confirm / cancel step for reopening an event that has already finished."""
+
+    def __init__(self, user_id, action):
+        super().__init__(timeout=120)
+        self.user_id, self.action, self.used = user_id, action, False
+
+    @discord.ui.button(label="Yes, extend it", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id or not _is_mod(interaction.user):
+            await interaction.response.send_message("⚠️ This belongs to the mod who opened it.", ephemeral=True)
+            return
+        if self.used:
+            await interaction.response.send_message("Already handled.", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(content="⏳ Working…", view=None)
+        await interaction.edit_original_response(content=await self.action())
+
+    @discord.ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("⚠️ This belongs to the mod who opened it.", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(content="Okay, nothing changed.", view=None)
+
+
+@event_group.command(name="extend", description="[Mod] Give an event more time: longer earning, or a longer-open shop")
+@app_commands.describe(
+    event="Which event",
+    what="What to extend",
+    days="Days to add",
+    hours="Hours to add (on top of the days)",
+    reason="Optional note shown in the announcement (like 'Discord was down')",
+    announce="Post a notice in the announcement channel? (default yes)",
+)
+@app_commands.choices(what=[
+    app_commands.Choice(name="Earning (the shop moves later too, so it keeps its full time)", value="earning"),
+    app_commands.Choice(name="The shop only (earning stays as it is)", value="shop"),
+])
+async def event_extend(interaction: discord.Interaction, event: int, what: app_commands.Choice[str],
+                       days: app_commands.Range[int, 0, 60] = 0, hours: app_commands.Range[int, 0, 23] = 0,
+                       reason: Optional[app_commands.Range[str, 0, 200]] = None, announce: bool = True):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    delta = timedelta(days=days, hours=hours)
+    if delta <= timedelta(0):
+        await interaction.response.send_message("⚠️ Add at least an hour: set `days` and/or `hours`.", ephemeral=True)
+        return
+    ev = get_event(event)
+    if not ev:
+        await interaction.response.send_message("⚠️ That event doesn't exist.", ephemeral=True)
+        return
+    kind = what.value
+    reason = (reason or "").strip() or None
+
+    async def do_it():
+        ok, result = extend_event(event, kind, delta, _now())
+        if not ok:
+            if isinstance(result, tuple):
+                return (f"⚠️ That would make earning overlap **{result[1]}**, and only one event can be earning at a time. "
+                        f"Try a shorter extension, or extend the shop instead.")
+            return "⚠️ That event doesn't exist." if result == "missing" else "⚠️ A cancelled event can't be extended."
+        if announce:
+            await _announce_extension(event, kind, result, reason)
+        else:
+            await _refresh_open_announcement(event)
+        updated = get_event(event)
+        return (f"✅ **{updated['name']}**: earning ends {_ts(updated['earn_end'])}, "
+                f"shop closes {_ts(updated['shop_close'])} ({_ts(updated['shop_close'], 'R')}).")
+
+    if event_phase(ev, _now()) == "closed":
+        await interaction.response.send_message(
+            f"**{ev['name']}** has already closed (and its closing was announced). Extending it will "
+            + ("let members earn points again" if kind == "earning" else "reopen the shop")
+            + ". Points aren't lost when an event closes, so everyone's balances are still there and spendable again. Continue?",
+            view=_ExtendConfirmView(interaction.user.id, do_it), ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(await do_it(), ephemeral=True)
+
+
+@event_extend.autocomplete("event")
+async def _ac_event_extend(interaction, current: str):
+    return await event_choices(interaction, current, ("scheduled", "earning", "shop", "closed"))
 
 
 @event_group.command(name="cancel", description="[Mod] Cancel an event that hasn't started yet")

@@ -3,7 +3,12 @@ santa.py - Secret Santa / gift & art exchanges for the guild
 ============================================================
 
 HOW AN EXCHANGE RUNS
-1. A mod starts one:           /santa start      (gift exchange, art exchange, or other)
+1. A mod starts one:           /santa start      (gift, NP, NC, art, or other). Several can run AT THE SAME TIME
+                               (say an art exchange, an NP exchange and an NC exchange), and one member
+                               can sign up for as many of them as they like. When more than one is running,
+                               commands take an `exchange` option (pick it from the list that pops up).
+   It can open right away, or on a day you choose (opens_on): the bot then posts the announcement by itself,
+   and when the sign-up deadline passes it posts a "sign-ups are closed" note and tells the mods.
 2. Members sign up:            the 🎁 button on the announcement (a pop-up form), or on the website,
                                which gives a short code to redeem here with /santa join code:XXXX
    Each person shares a wishlist (gift exchange) or the characters they'd like drawn (art exchange),
@@ -85,6 +90,16 @@ KINDS = {
             "wants_hint": "Who should your Santa draw? Names, descriptions, poses, moods, anything you'd love to see.",
             "links_label": "Reference links (one per line)",
             "avoid_label": "Please avoid (content, styles, ratings)"},
+    "np": {"label": "NP exchange", "noun": "NP gift",
+           "wants_label": "Items or themes you'd love (NP)",
+           "wants_hint": "What would you love to open? Item types, themes, favorite colors, pets or characters to match.",
+           "links_label": "Wishlist links (one per line)",
+           "avoid_label": "Please avoid (things you dislike)"},
+    "nc": {"label": "NC exchange", "noun": "NC gift",
+           "wants_label": "NC items or themes you'd love",
+           "wants_hint": "Which NC items or themes would you love? Wearables, species or colors you collect, things you already own.",
+           "links_label": "Wishlist links (one per line)",
+           "avoid_label": "Please avoid (items you own, dislikes)"},
     "other": {"label": "Exchange", "noun": "present",
               "wants_label": "What would you like?",
               "wants_hint": "What would make your Santa's job easy?",
@@ -128,6 +143,24 @@ def _end_of_pacific_day(text):
     """'2026-12-01' -> 11:59:59 PM Pacific that day, as UTC. Raises ValueError for anything else."""
     return datetime.strptime(text.strip(), "%Y-%m-%d").replace(
         hour=23, minute=59, second=59, tzinfo=PACIFIC).astimezone(timezone.utc)
+
+
+def parse_pacific(text, default_time=(23, 59, 59)):
+    """'2026-12-01' (uses default_time) or '2026-12-01 18:30' or '2026-12-01 6:30 PM', all Pacific time.
+    Returns UTC. Raises ValueError for anything else."""
+    text = " ".join(str(text).strip().upper().split())
+    try:
+        local = datetime.strptime(text, "%Y-%m-%d").replace(hour=default_time[0], minute=default_time[1], second=default_time[2])
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p", "%Y-%m-%d %I %p", "%Y-%m-%d %I%p"):
+            try:
+                local = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError("bad date")
+    return local.replace(tzinfo=PACIFIC).astimezone(timezone.utc)
 
 
 # ============================================================
@@ -220,6 +253,14 @@ def init_tables():
                 at TEXT NOT NULL
             );
         """)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(st_events)").fetchall()}
+        if "opens_at" not in columns:
+            conn.execute("ALTER TABLE st_events ADD COLUMN opens_at TEXT")
+        if "ping_role_id" not in columns:
+            conn.execute("ALTER TABLE st_events ADD COLUMN ping_role_id INTEGER")
+        if "closed_notice" not in columns:
+            conn.execute("ALTER TABLE st_events ADD COLUMN closed_notice INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE st_events SET closed_notice = 1")      # exchanges that already existed don't need a notice
         conn.commit()
 
 
@@ -231,12 +272,19 @@ def get_event(event_id):
     return dict(row) if row else None
 
 
-def active_event():
-    """The exchange that's currently running (only one at a time)."""
+def active_events(include_scheduled=False):
+    """Every exchange that's currently running, oldest first. Several can run at once.
+    include_scheduled also lists exchanges that are waiting for their opening day."""
+    states = "('signups', 'drawn', 'revealed', 'scheduled')" if include_scheduled else "('signups', 'drawn', 'revealed')"
     with _db() as conn:
-        row = conn.execute(
-            "SELECT * FROM st_events WHERE status IN ('signups', 'drawn', 'revealed') ORDER BY id DESC LIMIT 1").fetchone()
-    return dict(row) if row else None
+        rows = conn.execute(f"SELECT * FROM st_events WHERE status IN {states} ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def active_event():
+    """The most recently started running exchange, or None."""
+    events = active_events()
+    return events[-1] if events else None
 
 
 def event_by_message(message_id):
@@ -245,16 +293,21 @@ def event_by_message(message_id):
     return dict(row) if row else None
 
 
-def create_event(name, kind, created_by, channel_id, signups_close_at, exchange_by, budget, rules, public_page, now):
-    """Returns (True, event_id) or (False, reason)."""
+def create_event(name, kind, created_by, channel_id, signups_close_at, exchange_by, budget, rules, public_page, now,
+                 opens_at=None, ping_role_id=None):
+    """Returns (True, event_id) or (False, reason). With a future opens_at the exchange waits ('scheduled')
+    and the bot opens it by itself on that day."""
+    scheduled = opens_at is not None and opens_at > now + timedelta(minutes=2)
     with _txn() as conn:
-        if conn.execute("SELECT 1 FROM st_events WHERE status IN ('signups', 'drawn', 'revealed')").fetchone():
-            return (False, "An exchange is already running. Close or cancel it first with /santa close or /santa cancel.")
+        if conn.execute("SELECT 1 FROM st_events WHERE status IN ('signups', 'drawn', 'revealed', 'scheduled') AND LOWER(name) = LOWER(?)",
+                        (name,)).fetchone():
+            return (False, "A running exchange already has that name. Pick a different name so people can tell them apart.")
         cur = conn.execute(
             "INSERT INTO st_events (name, kind, status, created_by, created_at, announce_channel_id, signups_close_at, "
-            "exchange_by, budget, rules, public_page) VALUES (?, ?, 'signups', ?, ?, ?, ?, ?, ?, ?, ?)",
-            (name, kind if kind in KINDS else "other", created_by, _iso(now), channel_id, _iso(signups_close_at),
-             _iso(exchange_by), budget, rules, 1 if public_page else 0))
+            "exchange_by, budget, rules, public_page, opens_at, ping_role_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, kind if kind in KINDS else "other", "scheduled" if scheduled else "signups", created_by, _iso(now), channel_id,
+             _iso(signups_close_at), _iso(exchange_by), budget, rules, 1 if public_page else 0,
+             _iso(opens_at) if scheduled else None, ping_role_id))
         return (True, cur.lastrowid)
 
 
@@ -634,7 +687,7 @@ def close_event(event_id, now):
 def cancel_event(event_id, now):
     with _txn() as conn:
         ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
-        if not ev or ev["status"] != "signups":
+        if not ev or ev["status"] not in ("signups", "scheduled"):
             return (False, "Only an exchange that hasn't been drawn can be cancelled. Use /santa close for the rest.")
         conn.execute("UPDATE st_events SET status = 'cancelled', closed_at = ?, web_dirty = 1 WHERE id = ?", (_iso(now), event_id))
         conn.execute("UPDATE st_entries SET wants = '', links = '', avoid = '' WHERE event_id = ?", (event_id,))
@@ -682,7 +735,7 @@ def web_enabled():
 def web_link(event):
     if not web_enabled() or not event.get("public_page"):
         return None
-    return WEB_PUBLIC_URL.rstrip("/") + "/"
+    return WEB_PUBLIC_URL.rstrip("/") + "/?e=" + str(event["id"])
 
 
 async def _get_channel(channel_id):
@@ -736,7 +789,9 @@ def announcement_embed(event):
     status = event["status"]
     embed = discord.Embed(title=f"🎅 {event['name']}", color=EMBED_COLOR)
     lines = []
-    if status == "signups":
+    if status == "signups" and _now() >= _parse(event["signups_close_at"]):
+        lines.append("🔒 **Sign-ups are closed.** The matches will be drawn soon!")
+    elif status == "signups":
         lines.append(f"Join our **{kind['label'].lower()}**! You'll be matched with one person to give a {kind['noun']} to, "
                      f"and one other person will be giving to you. Nobody finds out who until the reveal.")
         lines.append(f"**Sign-ups close:** {_ts(event['signups_close_at'], 'F')} ({_ts(event['signups_close_at'], 'R')})")
@@ -764,6 +819,14 @@ def announcement_embed(event):
         embed.add_field(name="Received", value=f"{c['received']} / {c['matched']}", inline=True)
     embed.set_footer(text="Your match is secret: only you can see it.")
     return embed
+
+
+async def post_announcement(event, channel):
+    """Posts the announcement (with its buttons). Pings the chosen role, if there is one. Raises if it can't post."""
+    role_id = event.get("ping_role_id")
+    text = (f"<@&{role_id}> " if role_id else "") + f"🎄 **{event['name']}**: sign-ups are open until {_ts(event['signups_close_at'], 'F')}!"
+    mentions = discord.AllowedMentions(everyone=False, users=False, roles=[discord.Object(id=role_id)] if role_id else False)
+    return await channel.send(content=text, embed=announcement_embed(event), view=SantaView(), allowed_mentions=mentions)
 
 
 async def refresh_announcement(event_id):
@@ -820,7 +883,7 @@ class SantaView(discord.ui.View):
 
 class EntryModal(discord.ui.Modal):
     def __init__(self, event, existing=None):
-        super().__init__(title="Your Secret Santa entry"[:45])
+        super().__init__(title=f"Entry: {event['name']}"[:45])
         self.event_id = event["id"]
         kind = _kind(event)
         self.neopets = discord.ui.TextInput(label="Your Neopets username", required=True, min_length=3, max_length=20,
@@ -902,7 +965,7 @@ def _sent_text(ok, result):
 def _match_embed(event, giftee, giver_row):
     kind = _kind(event)
     embed = discord.Embed(title=f"🎅 You're the Secret Santa for {giftee['display_name']}!", color=EMBED_COLOR)
-    embed.description = f"Their Neopets username: **{giftee['neopets_name']}**"
+    embed.description = f"**{event['name']}**\nTheir Neopets username: **{giftee['neopets_name']}**"
     embed.add_field(name=kind["wants_label"][:256], value=(giftee["wants"] or "—")[:1024], inline=False)
     if giftee["links"]:
         embed.add_field(name="Links", value=giftee["links"][:1024], inline=False)
@@ -940,7 +1003,7 @@ async def do_mark_sent(interaction, event, undo=False):
     if await _deny_wrong_guild(interaction):
         return
     ok, result = mark_sent(event["id"], interaction.user.id, _now(), undo=undo)
-    await interaction.response.send_message(_sent_text(ok, result), ephemeral=True)
+    await interaction.response.send_message(f"**{event['name']}**: " + _sent_text(ok, result), ephemeral=True)
 
 
 class ReceivedModal(discord.ui.Modal):
@@ -1094,9 +1157,74 @@ def _clear_dirty(event_id):
 
 async def santa_tick(now=None):
     now = now or _now()
-    event = active_event()
-    if not event:
+    with _db() as conn:
+        waiting = [dict(r) for r in conn.execute("SELECT * FROM st_events WHERE status = 'scheduled' ORDER BY id").fetchall()]
+    for event in waiting:
+        try:
+            await _open_scheduled(event, now)
+        except Exception as e:
+            print(f"⚠️ Santa: couldn't open scheduled exchange {event['id']} ({type(e).__name__})")
+    for event in active_events():
+        try:
+            await _tick_one(event, now)
+        except Exception as e:
+            print(f"⚠️ Santa: problem with exchange {event['id']} ({type(e).__name__})")
+
+
+_open_warned = set()
+
+
+async def _open_scheduled(event, now):
+    """On the opening day: posts the announcement and starts taking sign-ups."""
+    if now < _parse(event["opens_at"]):
         return
+    if now >= _parse(event["signups_close_at"]):
+        cancel_event(event["id"], now)
+        await _mod_log(f"⚠️ **{event['name']}** was supposed to open, but its sign-up deadline had already passed, so it was cancelled.")
+        return
+    with _txn() as conn:
+        cur = conn.execute("UPDATE st_events SET status = 'signups', web_dirty = 1 WHERE id = ? AND status = 'scheduled'", (event["id"],))
+        if cur.rowcount == 0:
+            return                                          # another pass already opened it
+    event = get_event(event["id"])
+    channel = await _get_channel(event["announce_channel_id"])
+    try:
+        message = await post_announcement(event, channel)
+    except Exception as e:
+        print(f"⚠️ Santa: couldn't post the opening announcement ({type(e).__name__})")
+        with _db() as conn:
+            conn.execute("UPDATE st_events SET status = 'scheduled' WHERE id = ?", (event["id"],))
+            conn.commit()
+        if event["id"] not in _open_warned:
+            _open_warned.add(event["id"])
+            await _mod_log(f"⚠️ I couldn't post the opening announcement for **{event['name']}** (check that I can send messages and embeds "
+                           f"in the channel). I'll keep trying every minute. You can also cancel it with `/santa cancel`.")
+        return
+    set_announcement(event["id"], channel.id, message.id)
+    await push_web(event["id"])
+    await _mod_log(f"🎄 **{event['name']}** is now open for sign-ups.")
+
+
+async def _tick_one(event, now):
+    # the moment sign-ups close: say so once, and let the mods know it's ready to draw
+    if event["status"] == "signups" and not event["closed_notice"] and now >= _parse(event["signups_close_at"]):
+        with _db() as conn:
+            cur = conn.execute("UPDATE st_events SET closed_notice = 1, web_dirty = 1 WHERE id = ? AND closed_notice = 0", (event["id"],))
+            conn.commit()
+            first = cur.rowcount > 0
+        if first:
+            event["web_dirty"] = 1
+            n = counts(event["id"])["signed_up"]
+            channel = await _get_channel(event["announce_channel_id"])
+            if channel is not None:
+                try:
+                    await channel.send(f"🔒 **Sign-ups for {event['name']} are now closed!** {n} {'person' if n == 1 else 'people'} signed up. "
+                                       f"The matches will be drawn soon.")
+                except Exception:
+                    pass
+            await _mod_log(f"🔒 Sign-ups for **{event['name']}** have closed with **{n}** signed up. "
+                           + ("When you're ready, run `/santa draw` and choose it." if n >= MIN_PLAYERS
+                              else f"That's fewer than the {MIN_PLAYERS} needed, so it can't be drawn yet."))
     # reminders before the deadline: one a week out and one two days out. If the bot was offline and both
     # are due at once, only a single reminder goes out.
     if event["status"] == "drawn":
@@ -1144,6 +1272,74 @@ async def santa_loop():
 #  COMMANDS
 # ============================================================
 
+
+# ---------------------------------------------------------------- choosing which exchange a command is about
+
+def _kind_label(event):
+    return _kind(event)["label"]
+
+
+def _running_list(events):
+    return "\n".join(f"• **{e['name']}** ({_kind_label(e)})" for e in events)
+
+
+async def _pick_event(interaction, exchange, statuses=None, mine=False, none_text=None, include_scheduled=False):
+    """Works out which exchange a command means. Returns the event, or None after telling the person what to do.
+    exchange: what they chose in the pop-up list (an id) or typed (a name).
+    statuses: only exchanges in these stages count.  mine: with no choice made, use the one they're in."""
+    events = active_events(include_scheduled)
+    if exchange:
+        text = str(exchange).strip()
+        match = None
+        if text.isdigit():
+            match = next((e for e in events if e["id"] == int(text)), None)
+        if match is None:
+            exact = [e for e in events if e["name"].lower() == text.lower()]
+            partial = [e for e in events if text.lower() in e["name"].lower()]
+            match = exact[0] if len(exact) == 1 else (partial[0] if len(partial) == 1 and not exact else None)
+        if match is None:
+            await interaction.response.send_message("⚠️ I couldn't tell which exchange you mean. Pick one from the list that pops up as you type.\n"
+                                                    + (_running_list(events) if events else ""), ephemeral=True)
+            return None
+        if statuses and match["status"] not in statuses:
+            await interaction.response.send_message(none_text or f"⚠️ That can't be done for **{match['name']}** right now (it's in the '{match['status']}' stage).", ephemeral=True)
+            return None
+        return match
+    if statuses:
+        events = [e for e in events if e["status"] in statuses]
+    if not events:
+        await interaction.response.send_message(none_text or "There's no Secret Santa running right now.", ephemeral=True)
+        return None
+    if len(events) == 1:
+        return events[0]
+    if mine:
+        joined = [e for e in events if get_entry(e["id"], interaction.user.id)]
+        if len(joined) == 1:
+            return joined[0]
+        if not joined:
+            await interaction.response.send_message("You're not signed up for any of the running exchanges:\n" + _running_list(events), ephemeral=True)
+            return None
+        events = joined
+    await interaction.response.send_message("⚠️ More than one exchange fits, so please choose one in the **exchange** box:\n" + _running_list(events), ephemeral=True)
+    return None
+
+
+async def _exchange_autocomplete(interaction: discord.Interaction, current: str):
+    events = active_events()
+    joined = {e["id"] for e in events if get_entry(e["id"], interaction.user.id)}
+    events.sort(key=lambda e: (e["id"] not in joined, e["id"]))
+    needle = (current or "").lower()
+    out = []
+    for e in events:
+        label = f"{e['name']} ({_kind_label(e)})" + (" ✓" if e["id"] in joined else "")
+        if needle in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=str(e["id"])))
+    return out[:25]
+
+
+EXCHANGE_HELP = "Which exchange (only needed when more than one is running)"
+
+
 santa_group = app_commands.Group(name="santa", description="Secret Santa gift and art exchanges", guild_only=True)
 
 
@@ -1181,30 +1377,37 @@ def _kind_choices():
     return [app_commands.Choice(name=v["label"], value=k) for k, v in KINDS.items()]
 
 
-@santa_group.command(name="start", description="[Mod] Start a Secret Santa gift or art exchange")
+@santa_group.command(name="start", description="[Mod] Start a Secret Santa exchange (you can run several at once)")
 @app_commands.describe(
     name="What it's called, like 'Winter Secret Santa 2026'",
-    kind="A gift exchange or an art exchange (changes what people are asked)",
-    signups_until="Last day to sign up, as YYYY-MM-DD (closes 11:59 PM Pacific)",
+    kind="Gift, NP, NC or art exchange (changes what people are asked). You can run several at once",
+    signups_until="When sign-ups close (Pacific time): 2026-12-01 closes 11:59 PM, or 2026-12-01 6:00 PM for an exact time",
     exchange_by="Day gifts or art are due, as YYYY-MM-DD (11:59 PM Pacific)",
     budget="Guidelines, like 'Up to 1 million NP in items' or 'one piece of art, SFW'",
     rules="Any extra rules",
     announce_channel="Where to post (default: this channel)",
     public_page="Also show an event page on the website? (default yes)",
+    opens_on="Open sign-ups later (Pacific time): 2026-11-20 opens at 9:00 AM, or 2026-11-20 6:00 PM. Blank = open now",
+    ping="A role to @mention when sign-ups open",
 )
 @app_commands.choices(kind=_kind_choices())
 async def santa_start(interaction: discord.Interaction, name: app_commands.Range[str, 1, 80], kind: app_commands.Choice[str],
                       signups_until: str, exchange_by: str, budget: Optional[app_commands.Range[str, 0, BUDGET_MAX]] = None,
                       rules: Optional[app_commands.Range[str, 0, RULES_MAX]] = None,
-                      announce_channel: Optional[discord.TextChannel] = None, public_page: bool = True):
+                      announce_channel: Optional[discord.TextChannel] = None, public_page: bool = True,
+                      opens_on: Optional[str] = None, ping: Optional[discord.Role] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
     try:
-        close_at, due_at = _end_of_pacific_day(signups_until), _end_of_pacific_day(exchange_by)
+        close_at, due_at = parse_pacific(signups_until), _end_of_pacific_day(exchange_by)
+        open_at = parse_pacific(opens_on, (9, 0, 0)) if opens_on and opens_on.strip() else None
     except ValueError:
-        await interaction.response.send_message("⚠️ Dates should look like `2026-12-01`.", ephemeral=True)
+        await interaction.response.send_message("⚠️ Dates should look like `2026-12-01`, or with a time: `2026-12-01 6:00 PM` (Pacific time).", ephemeral=True)
         return
     now = _now()
+    if open_at is not None and open_at >= close_at - timedelta(hours=1):
+        await interaction.response.send_message("⚠️ Sign-ups need to open before they close (with at least an hour to spare).", ephemeral=True)
+        return
     if close_at <= now + timedelta(hours=1):
         await interaction.response.send_message("⚠️ The sign-up deadline has to be in the future.", ephemeral=True)
         return
@@ -1213,14 +1416,21 @@ async def santa_start(interaction: discord.Interaction, name: app_commands.Range
         return
     channel = announce_channel or interaction.channel
     ok, event_id = create_event(name.strip(), kind.value, interaction.user.id, getattr(channel, "id", None), close_at, due_at,
-                                (budget or "").strip() or None, (rules or "").strip() or None, public_page, now)
+                                (budget or "").strip() or None, (rules or "").strip() or None, public_page, now,
+                                opens_at=open_at, ping_role_id=ping.id if ping else None)
     if not ok:
         await interaction.response.send_message(f"⚠️ {event_id}", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     event = get_event(event_id)
+    if event["status"] == "scheduled":
+        await interaction.followup.send(
+            f"🗓️ **{name.strip()}** is scheduled. I'll post the announcement in {getattr(channel, 'mention', 'that channel')} on {_ts(event['opens_at'], 'F')} "
+            f"({_ts(event['opens_at'], 'R')}), and sign-ups will close {_ts(_iso(close_at), 'F')}." + (f" I'll mention {ping.mention}." if ping else "")
+            + "\nChanged your mind? `/santa cancel` works until it opens.", ephemeral=True)
+        return
     try:
-        message = await channel.send(embed=announcement_embed(event), view=SantaView())
+        message = await post_announcement(event, channel)
     except Exception as e:
         print(f"⚠️ Santa: couldn't post the announcement ({type(e).__name__})")
         cancel_event(event_id, now)
@@ -1231,30 +1441,21 @@ async def santa_start(interaction: discord.Interaction, name: app_commands.Range
     link = web_link(event)
     await interaction.followup.send(
         f"✅ **{name.strip()}** is open for sign-ups until {_ts(_iso(close_at))}." + (f"\n🌐 Event page: {link}" if link else "")
-        + "\nWhen you're ready, run `/santa draw`.", ephemeral=True)
+        + f"\nWhen you're ready, run `/santa draw` and choose **{name.strip()}**.", ephemeral=True)
 
 
 @santa_group.command(name="join", description="Sign up (or edit your entry). Have a code from the website? Add it here")
-@app_commands.describe(code="The code from the website sign-up form, like K7M2-9QPX")
-async def santa_join(interaction: discord.Interaction, code: Optional[str] = None):
+@app_commands.describe(code="The code from the website sign-up form, like K7M2-9QPX", exchange=EXCHANGE_HELP)
+async def santa_join(interaction: discord.Interaction, code: Optional[str] = None, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction):
         return
-    event = active_event()
-    if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
-        return
     if not code:
-        await open_entry_form(interaction, event)
+        event = await _pick_event(interaction, exchange)
+        if event:
+            await open_entry_form(interaction, event)
         return
     if getattr(interaction.user, "bot", False):
         await interaction.response.send_message("⚠️ Bots can't take part.", ephemeral=True)
-        return
-    existing = get_entry(event["id"], interaction.user.id)
-    if event["status"] != "signups" and not existing:
-        await interaction.response.send_message("⚠️ Sign-ups are closed.", ephemeral=True)
-        return
-    if event["status"] == "signups" and not existing and _now() >= _parse(event["signups_close_at"]):
-        await interaction.response.send_message("⚠️ Sign-ups have closed.", ephemeral=True)
         return
     if not _claim_allowed(interaction.user.id):
         await interaction.response.send_message("⚠️ That's a lot of tries. Please wait a few minutes and check the code.", ephemeral=True)
@@ -1264,33 +1465,68 @@ async def santa_join(interaction: discord.Interaction, code: Optional[str] = Non
     if not ok:
         await interaction.followup.send(f"⚠️ {result}", ephemeral=True)
         return
+    # the code itself says which exchange it's for
+    event = get_event(result.get("event_id")) if isinstance(result.get("event_id"), int) else None
+    if event is None or event["status"] not in ("signups", "drawn", "revealed"):
+        await interaction.followup.send("⚠️ That code was for an exchange that isn't running any more.", ephemeral=True)
+        return
+    existing = get_entry(event["id"], interaction.user.id)
+    if not existing and (event["status"] != "signups" or _now() >= _parse(event["signups_close_at"])):
+        await interaction.followup.send(f"⚠️ Sign-ups for **{event['name']}** have closed.", ephemeral=True)
+        return
     valid, cleaned = validate_entry(result.get("neopets_name"), result.get("wants"), result.get("links"), result.get("avoid"))
     if not valid:
-        await interaction.followup.send(f"⚠️ {cleaned} Please press the 🎁 button instead.", ephemeral=True)
+        await interaction.followup.send(f"⚠️ {cleaned} Please press the 🎁 button on the **{event['name']}** announcement instead.", ephemeral=True)
         return
     saved, outcome = upsert_entry(event["id"], interaction.user.id, interaction.user.display_name, cleaned, "web", _now())
-    await interaction.followup.send(_entry_saved_text(outcome) if saved else f"⚠️ {outcome}", ephemeral=True)
+    await interaction.followup.send((f"**{event['name']}**\n" + _entry_saved_text(outcome)) if saved else f"⚠️ {outcome}", ephemeral=True)
+
+
+@santa_group.command(name="list", description="See the exchanges that are running and which ones you're in")
+async def santa_list(interaction: discord.Interaction):
+    if await _deny_wrong_guild(interaction):
+        return
+    events = active_events(True)
+    if not events:
+        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
+        return
+    lines = []
+    for e in events:
+        mine = get_entry(e["id"], interaction.user.id)
+        stage = {"signups": "sign-ups open", "drawn": "matches drawn", "revealed": "revealed", "scheduled": "coming soon"}.get(e["status"], e["status"])
+        line = f"{'✅' if mine else '▫️'} **{e['name']}** ({_kind_label(e)}): {stage}"
+        if e["status"] == "scheduled":
+            line += f", sign-ups open {_ts(e['opens_at'], 'R')}"
+        elif e["status"] == "signups" and _now() >= _parse(e["signups_close_at"]):
+            line += ", sign-ups closed"
+        elif e["status"] == "signups":
+            line += f", sign-ups close {_ts(e['signups_close_at'], 'R')}"
+        elif e["status"] == "drawn":
+            line += f", due {_ts(e['exchange_by'], 'R')}"
+        lines.append(line)
+    lines.append("\n✅ = you're in. You can join as many as you like!")
+    await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
 
 
 @santa_group.command(name="leave", description="Withdraw from the exchange (before the matches are drawn)")
-async def santa_leave(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_leave(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=True)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     ok, why = leave_event(event["id"], interaction.user.id)
     await interaction.response.send_message("👋 You've been removed. You can sign up again until sign-ups close." if ok else f"⚠️ {why}", ephemeral=True)
 
 
 @santa_group.command(name="me", description="See your entry and where things stand")
-async def santa_me(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_me(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=True)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     mine = get_entry(event["id"], interaction.user.id)
     if not mine:
@@ -1312,36 +1548,36 @@ async def santa_me(interaction: discord.Interaction):
 
 
 @santa_group.command(name="match", description="See who you're the Secret Santa for")
-async def santa_match(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_match(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=True)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     await show_match(interaction, event)
 
 
 @santa_group.command(name="sent", description="Mark your gift as sent")
+@app_commands.describe(exchange=EXCHANGE_HELP)
 @app_commands.describe(undo="Set this to un-mark it")
-async def santa_sent(interaction: discord.Interaction, undo: bool = False):
+async def santa_sent(interaction: discord.Interaction, undo: bool = False, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=True)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     await do_mark_sent(interaction, event, undo)
 
 
 @santa_group.command(name="received", description="Say your gift arrived, with an optional thank-you")
+@app_commands.describe(exchange=EXCHANGE_HELP)
 @app_commands.describe(thanks="A thank-you note for your Santa (shown at the reveal)")
-async def santa_received(interaction: discord.Interaction, thanks: Optional[app_commands.Range[str, 0, THANKS_MAX]] = None):
+async def santa_received(interaction: discord.Interaction, thanks: Optional[app_commands.Range[str, 0, THANKS_MAX]] = None, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=True)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     ok, result = mark_received(event["id"], interaction.user.id, _now(), thanks)
     await interaction.response.send_message(("💌 Marked as received. Thank you!" if result == "marked" else "✅ Already marked. Your note was updated.")
@@ -1349,13 +1585,13 @@ async def santa_received(interaction: discord.Interaction, thanks: Optional[app_
 
 
 @santa_group.command(name="block", description="[Mod] Make sure two members are never matched with each other")
+@app_commands.describe(exchange=EXCHANGE_HELP)
 @app_commands.describe(member_a="First member", member_b="Second member")
-async def santa_block(interaction: discord.Interaction, member_a: discord.Member, member_b: discord.Member):
+async def santa_block(interaction: discord.Interaction, member_a: discord.Member, member_b: discord.Member, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=False)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     ok, why = add_block(event["id"], member_a.id, member_b.id)
     await interaction.response.send_message(
@@ -1364,24 +1600,24 @@ async def santa_block(interaction: discord.Interaction, member_a: discord.Member
 
 
 @santa_group.command(name="unblock", description="[Mod] Remove a blocked pair")
-async def santa_unblock(interaction: discord.Interaction, member_a: discord.Member, member_b: discord.Member):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_unblock(interaction: discord.Interaction, member_a: discord.Member, member_b: discord.Member, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=False)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     ok, why = remove_block(event["id"], member_a.id, member_b.id)
     await interaction.response.send_message("✅ Unblocked." if ok else f"⚠️ {why}", ephemeral=True)
 
 
 @santa_group.command(name="draw", description="[Mod] Draw the matches (everyone gets someone; nobody gets themselves)")
-async def santa_draw(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_draw(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
-    if not event or event["status"] != "signups":
-        await interaction.response.send_message("⚠️ There's no exchange waiting to be drawn.", ephemeral=True)
+    event = await _pick_event(interaction, exchange, statuses=("signups",), none_text="⚠️ There's no exchange waiting to be drawn.")
+    if not event:
         return
     n = len(entries_for(event["id"]))
     blocks = len(blocked_pairs(event["id"]))
@@ -1411,29 +1647,39 @@ async def santa_draw(interaction: discord.Interaction):
         + "\nThis can't be redone.", view=_ConfirmView(interaction.user.id, do_draw), ephemeral=True)
 
 
-@santa_group.command(name="status", description="[Mod] How the exchange is going (counts only, no names)")
-async def santa_status(interaction: discord.Interaction):
-    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
-        return
-    event = active_event() or None
-    if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
-        return
+def _status_text(event):
     c = counts(event["id"])
-    text = (f"🎅 **{event['name']}**: {event['status']}\nSigned up: {c['signed_up']} · Blocked pairs: {len(blocked_pairs(event['id']))}\n"
+    text = (f"🎅 **{event['name']}** ({_kind_label(event)}): {event['status']}"
+            + (f", opens {_ts(event['opens_at'], 'F')}" if event["status"] == "scheduled" else "") + f"\nSigned up: {c['signed_up']} · Blocked pairs: {len(blocked_pairs(event['id']))}\n"
             f"Sign-ups close {_ts(event['signups_close_at'])} · Due {_ts(event['exchange_by'])}")
     if event["status"] != "signups":
         text += f"\nMatched: {c['matched']} · Sent: {c['sent']} · Received: {c['received']}"
-    await interaction.response.send_message(text, ephemeral=True)
+    return text
+
+
+@santa_group.command(name="status", description="[Mod] How the exchange(s) are going (counts only, no names)")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_status(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    if not exchange and len(active_events(True)) > 1:
+        text = "\n\n".join(_status_text(e) for e in active_events(True))
+        await interaction.response.send_message(text[:1990], ephemeral=True)
+        return
+    event = await _pick_event(interaction, exchange, include_scheduled=True)
+    if not event:
+        return
+    await interaction.response.send_message(_status_text(event), ephemeral=True)
 
 
 @santa_group.command(name="remind", description="[Mod] Send a reminder to everyone who hasn't marked their gift sent")
-async def santa_remind(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_remind(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
-    if not event or event["status"] != "drawn":
-        await interaction.response.send_message("⚠️ Reminders only make sense after the draw and before the reveal.", ephemeral=True)
+    event = await _pick_event(interaction, exchange, statuses=("drawn",),
+                              none_text="⚠️ Reminders only make sense after the draw and before the reveal.")
+    if not event:
         return
     await interaction.response.defer(ephemeral=True)
     delivered, failed = await remind_givers(event)
@@ -1441,13 +1687,13 @@ async def santa_remind(interaction: discord.Interaction):
 
 
 @santa_group.command(name="lookup", description="[Mod] Emergency only: see one member's match. Always logged to the mod channel")
+@app_commands.describe(exchange=EXCHANGE_HELP)
 @app_commands.describe(member="The member to look up")
-async def santa_lookup(interaction: discord.Interaction, member: discord.Member):
+async def santa_lookup(interaction: discord.Interaction, member: discord.Member, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=False)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     ok, result = lookup_match(event["id"], interaction.user.id, member.id, _now())
     if not ok:
@@ -1462,13 +1708,13 @@ async def santa_lookup(interaction: discord.Interaction, member: discord.Member)
 
 
 @santa_group.command(name="dropout", description="[Mod] Remove someone, and repair the matches if they've been drawn")
+@app_commands.describe(exchange=EXCHANGE_HELP)
 @app_commands.describe(member="The member leaving the exchange")
-async def santa_dropout(interaction: discord.Interaction, member: discord.Member):
+async def santa_dropout(interaction: discord.Interaction, member: discord.Member, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=False)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
     if not get_entry(event["id"], member.id):
         await interaction.response.send_message("⚠️ That member isn't in this exchange.", ephemeral=True)
@@ -1542,12 +1788,12 @@ def _reveal_embeds(event, pairs):
 
 
 @santa_group.command(name="reveal", description="[Mod] Reveal who had whom, with any thank-you notes")
-async def santa_reveal(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_reveal(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
-    if not event or event["status"] != "drawn":
-        await interaction.response.send_message("⚠️ There's no drawn exchange to reveal.", ephemeral=True)
+    event = await _pick_event(interaction, exchange, statuses=("drawn",), none_text="⚠️ There's no drawn exchange to reveal.")
+    if not event:
         return
     c = counts(event["id"])
 
@@ -1573,12 +1819,12 @@ async def santa_reveal(interaction: discord.Interaction):
 
 
 @santa_group.command(name="close", description="[Mod] End the exchange and erase everyone's wishlists and notes")
-async def santa_close(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_close(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
+    event = await _pick_event(interaction, exchange, mine=False)
     if not event:
-        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
         return
 
     async def do_close():
@@ -1595,24 +1841,32 @@ async def santa_close(interaction: discord.Interaction):
 
 
 @santa_group.command(name="cancel", description="[Mod] Cancel an exchange that hasn't been drawn yet")
-async def santa_cancel(interaction: discord.Interaction):
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_cancel(interaction: discord.Interaction, exchange: Optional[str] = None):
     if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-    event = active_event()
-    if not event or event["status"] != "signups":
-        await interaction.response.send_message("⚠️ Only an exchange that hasn't been drawn can be cancelled.", ephemeral=True)
+    event = await _pick_event(interaction, exchange, statuses=("signups", "scheduled"), include_scheduled=True,
+                              none_text="⚠️ Only an exchange that hasn't been drawn can be cancelled.")
+    if not event:
         return
 
     async def do_cancel():
         ok, why = cancel_event(event["id"], _now())
         if not ok:
             return f"⚠️ {why}"
+        if event["status"] == "scheduled":
+            return "🚫 Cancelled. It hadn't opened yet, so nothing was posted."
         await refresh_announcement(event["id"])
         await push_web(event["id"])
         return "🚫 Cancelled. Everyone's entries were erased."
 
     await interaction.response.send_message(f"Cancel **{event['name']}**? Everyone's entries will be erased.",
                                             view=_ConfirmView(interaction.user.id, do_cancel), ephemeral=True)
+
+
+for _cmd in (santa_join, santa_leave, santa_me, santa_match, santa_sent, santa_received, santa_block, santa_unblock,
+             santa_draw, santa_status, santa_remind, santa_lookup, santa_dropout, santa_reveal, santa_close, santa_cancel):
+    _cmd.autocomplete("exchange")(_exchange_autocomplete)
 
 
 # ============================================================

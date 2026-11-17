@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import points
 import calendar_sync   
 import contest
+import santa
 
 # ============================================================
 #  CONFIGURATION — edit these values
@@ -1272,6 +1273,7 @@ async def on_ready():
     points.start_background(bot)
     contest.start_background(bot)
     calendar_sync.start_background(bot, get_db, MAIN_GUILD_NAME) 
+    santa.start_background(bot)
     
 
 
@@ -2728,4 +2730,6 @@ points.setup(
     request_channel_name=STRIKE_ALERT_CHANNEL,
 )
 contest.setup(bot, get_db, BOT_MOD_ROLES, MAIN_GUILD_NAME)
+santa.setup(bot, get_db, BOT_MOD_ROLES, MAIN_GUILD_NAME, STRIKE_ALERT_CHANNEL)
 bot.run(BOT_TOKEN)
+

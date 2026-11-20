@@ -1,2735 +1,2030 @@
-import discord
-from discord import app_commands
-from discord.ext import commands
+"""
+santa.py - Secret Santa / gift & art exchanges for the guild
+============================================================
+
+HOW AN EXCHANGE RUNS
+1. A mod starts one:           /santa start      (gift, NP, NC, art, or other). Several can run AT THE SAME TIME
+                               (say an art exchange, an NP exchange and an NC exchange), and one member
+                               can sign up for as many of them as they like. When more than one is running,
+                               commands take an `exchange` option (pick it from the list that pops up).
+   It can open right away, or on a day you choose (opens_on): the bot then posts the announcement by itself,
+   and when the sign-up deadline passes it posts a "sign-ups are closed" note and tells the mods.
+2. Members sign up:            the 🎁 button on the announcement (a pop-up form), or on the website,
+                               which gives a short code to redeem here with /santa join code:XXXX
+   Each person shares a wishlist (gift exchange) or the characters they'd like drawn (art exchange),
+   plus optional links and things to avoid. Only their Secret Santa ever sees it.
+   Dates can be changed later with /santa reschedule, and a waiting exchange can be opened early with /santa open.
+   Pairs can be blocked (/santa block) as soon as the exchange exists, even while it's still waiting to open,
+   so nobody can sign up before the blocks are in place.
+3. A mod draws the matches:    /santa draw       (everyone gets a giftee; nobody gets themselves)
+4. Everyone checks their match with the 🎅 button (only they can see it), sends their gift or art,
+   and marks it 📦 sent. Receivers mark 💌 received (with an optional thank-you note).
+5. A mod reveals the pairs:    /santa reveal     then   /santa close  (which erases wishlists and notes)
+
+WHO CAN SEE WHAT
+  - Members see only their OWN giftee. Nobody is told who their Santa is.
+  - The website only ever receives the event info and counts. Matches are never stored there; they
+    appear on the website only if a mod runs /santa reveal.
+  - Mods can look up one member's match in an emergency (/santa lookup). Every lookup is written to
+    the mod channel, so it is never a secret one.
+
+HOOKS NEEDED IN main.py (3 small edits):
+    import santa                                                                (near the top)
+    santa.setup(bot, get_db, BOT_MOD_ROLES, MAIN_GUILD_NAME, STRIKE_ALERT_CHANNEL)   (just before bot.run)
+    santa.start_background(bot)                                                 (in on_ready, with the other tasks)
+"""
+
 import asyncio
 import os
+import random
 import re
-import sqlite3
-import calendar
-import aiohttp
-import html
-import xml.etree.ElementTree as ET
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from zoneinfo import ZoneInfo
-import points
-import calendar_sync   
-import contest
-import santa
+
+import aiohttp
+import discord
+from discord import app_commands
 
 # ============================================================
-#  CONFIGURATION — edit these values
+#  CONFIGURATION - edit these values
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
+# The main server's name is added automatically. Add a test server's exact name to try it there.
+SANTA_GUILD_NAMES_EXTRA = []
 
-ACTIVE_ROLE_NAME = "Active"          # Must match your role name exactly
-ACTIVE_DURATION_DAYS = 30            # Days before role is removed
+MIN_PLAYERS = 3                # an exchange needs at least this many people
+MAX_PLAYERS = 100
 
-# Channel names to ignore (no # symbol needed)
-IGNORED_CHANNELS = [
-    "roles",
-    "directory",
-    "bookmarks",
-    "announcemnts",        # keeping your spelling so it matches your server
-    "🛡️︱council",
-    "💍︱mudae",
-]
+WANTS_MAX = 800                # wishlist / character info
+LINKS_MAX_COUNT = 5            # how many links a person can share
+AVOID_MAX = 400
+THANKS_MAX = 300
+RULES_MAX = 1500
+BUDGET_MAX = 200
 
-# Giveaway channel settings
-GIVEAWAY_CHANNEL = "🎁︱giveaways"          # Channel name without #
-GIVEAWAY_BOT_ROLE = "GiveawayBot"          # Role name of the giveaway bot — must match exactly
-GIVEAWAY_DELETE_SECONDS = 600              # Delete messages after 10 minutes
-GIVEAWAY_PING_ROLE = "Giveaways"           # Role to ping when a new giveaway is detected
+REMINDER_DAYS = (7, 2)         # givers who haven't marked their gift sent are reminded this many days before the deadline
+LOOP_SECONDS = 60
+WEB_PUSH_MIN_SECONDS = 30      # at most one website update this often while people are signing up
+CLAIM_ATTEMPTS = 5             # website codes a member may try...
+CLAIM_WINDOW_SECONDS = 600     # ...per this many seconds
 
-# Food Club settings
-FOOD_CLUB_CHANNEL = "🥕︱food-club"          # Channel name without #
-FOOD_CLUB_REDDIT_USER = "nsheng"           # Reddit user who comments the daily outlook
-FOOD_CLUB_CHECK_INTERVAL_HOURS = 3         # How often to re-check if today's thread/comment isn't up yet
+# The public page on your website. It reuses ACTIVITY_SYNC_SECRET, like your other website syncs.
+# Set SANTA_WEB_SYNC_URL to an empty string to switch the website side off entirely.
+WEB_SYNC_URL = os.environ.get("SANTA_WEB_SYNC_URL", "https://athenaeumarchive.com/santa/santa_sync.php")
+WEB_CLAIM_URL = os.environ.get("SANTA_CLAIM_URL", "https://athenaeumarchive.com/santa/santa_claim.php")
+WEB_PUBLIC_URL = os.environ.get("SANTA_PUBLIC_URL", "https://athenaeumarchive.com/santa/")
+WEB_SECRET_ENV = "ACTIVITY_SYNC_SECRET"
 
-BOT_MOD_ROLES = ["Moderator", "Admin", "Coordinator"]   # Role names allowed to use admin commands like /foodclubreset
+EMBED_COLOR = 0xB5303A
+PACIFIC = ZoneInfo("America/Los_Angeles")
 
-# --- Weekly bc-entries channel clearing ---
-BC_ENTRIES_CHANNEL = "👑︱bc-entries"  # channel name (no #)
-BC_CLEAR_WEEKDAY = 4       # Monday=0 ... Friday=4 ... Sunday=6
-BC_CLEAR_HOUR = 11         # 24-hour, Pacific time
-BC_CLEAR_MINUTE = 30
-BC_CLEAR_CHECK_INTERVAL_MINUTES = 10  # how often the bot checks whether it's time yet
-
-# --- Birthdays ---
-BIRTHDAY_CHANNEL = "birthdays"
-BIRTHDAY_ROLE_NAME = "🎂"
-BIRTHDAY_CHECK_HOUR = 0     # midnight, Pacific time
-BIRTHDAY_CHECK_MINUTE = 5   # a few minutes past midnight, to avoid exact-midnight edge cases
-BIRTHDAY_CHECK_INTERVAL_MINUTES = 15
-
-# --- Suggestions ---
-SUGGESTIONS_CHANNEL = "💡︱suggestions-feedback"
-
-# --- Activity tracker (mod-only page on the website) ---
-ACTIVITY_SYNC_URL = os.environ.get("ACTIVITY_SYNC_URL", "https://mods.athenaeumarchive.com/activity_sync.php")
-ACTIVITY_SYNC_SECRET = os.environ.get("ACTIVITY_SYNC_SECRET")  # shared secret, set this on Railway
-ACTIVITY_SYNC_INTERVAL_HOURS = 1
-MESSAGE_LOG_RETENTION_DAYS = 185  # needs to cover the 180-day threshold baseline window, plus a small buffer
-
-# Since the bot is also in small test servers, member count / cap only
-# makes sense for your actual guild specifically — confirm this matches
-# your real server's name exactly (check the bot's own logs if unsure).
-MAIN_GUILD_NAME = "✿ ━ 𝘈𝘵𝘩𝘦𝘯𝘢𝘦𝘶𝘮"
-MEMBER_CAP = 100
-
-# --- Strike system (Discord-only, mod commands) ---
-TEMP_STRIKE_DURATION_DAYS = 45       # how long a first temporary "bee sting" strike lasts before fading
-TEMP_STRIKE_ESCALATED_DURATION_DAYS = 90  # ~3 months — used if a NEW temp strike lands while a previous one is still active
-STRIKE_ALERT_THRESHOLD = 3           # active strikes (temp + permanent) that triggers a mod alert
-STRIKE_ALERT_CHANNEL = "🔴︱mod-alerts"  # channel name (no #) where strike/purge/violation alerts post
-
-# --- Minor violation escalation ladder ---
-# Level 1 -> 30 day cooldown. Re-triggered inside that window -> Level 2 -> 90 day
-# cooldown. Re-triggered inside THAT window -> flagged for manual ban (bot never
-# bans automatically). If a cooldown fully expires with no re-trigger, the next
-# violation starts fresh back at Level 1.
-# --- Minor violation escalation (now merged into the unified strike system) ---
-MINOR_VIOLATION_DURATION_DAYS = 30            # first minor violation cooldown
-MINOR_VIOLATION_ESCALATED_DURATION_DAYS = 90  # ~3 months, if re-triggered while still active
-
-# --- Adaptive activity thresholds ---
-# Rather than fixed guessed numbers, the "Really Active" / "Active" cutoffs
-# are recalculated from actual server-wide posting data every 30 days, using
-# a 6-month trailing window. Slow-moving on purpose — see conversation notes
-# on why a fast-reacting baseline could mask a real decline.
-THRESHOLD_BASELINE_WINDOW_DAYS = 180
-THRESHOLD_RECALC_INTERVAL_DAYS = 30
-THRESHOLD_HIGH_PERCENTILE = 0.85   # top 15% of posters -> "Really Active" cutoff
-THRESHOLD_MEDIUM_PERCENTILE = 0.60  # top 40% of posters -> "Active" cutoff
-THRESHOLD_MIN_SAMPLE_SIZE = 10      # don't recalculate off too small a sample
-DEFAULT_HIGH_THRESHOLD = 40.0        # grounded in real member data (was 150 — see conversation notes)
-DEFAULT_MEDIUM_THRESHOLD = 10.0      # was 80
-
-# --- Inactivity purge notifications ---
-# Mods still remove people manually — this just tells them when someone
-# crosses the threshold, instead of relying on someone remembering to check.
-# Server boosters are fully immune as long as they're currently boosting.
-PURGE_THRESHOLD_DAYS = 180          # ~6 months of total silence
-PURGE_HIATUS_THRESHOLD_DAYS = 360   # ~12 months if flagged as on hiatus
-PURGE_CHECK_INTERVAL_HOURS = 24
-HIATUS_LIST_URL = os.environ.get("HIATUS_LIST_URL", "https://mods.athenaeumarchive.com/hiatus_list.php")
-REMOVAL_LOG_URL = os.environ.get("REMOVAL_LOG_URL", "https://mods.athenaeumarchive.com/removal_log.php")
-PENDING_ALERTS_URL = os.environ.get("PENDING_ALERTS_URL", "https://mods.athenaeumarchive.com/pending_alerts_fetch.php")
-PENDING_ALERTS_CHECK_INTERVAL_MINUTES = 3
-
-# Where the persistent database lives — this should point inside your Railway Volume
-DB_PATH = os.environ.get("DB_PATH", "/data/atheniumbot.db")
+# Exchange types. They set the wording on the sign-up form.
+KINDS = {
+    "gift": {"label": "Gift exchange", "noun": "gift",
+             "wants_label": "Wishlist: items, NP, or themes you'd love",
+             "wants_hint": "Things you'd love to get, items, NP, or themes. A few ideas help your Santa.",
+             "links_label": "Wishlist links (one per line)",
+             "avoid_label": "Please avoid (things you dislike)"},
+    "art": {"label": "Art exchange", "noun": "piece of art",
+            "wants_label": "Character(s) to draw & what you'd like",
+            "wants_hint": "Who should your Santa draw? Names, descriptions, poses, moods, anything you'd love to see.",
+            "links_label": "Reference links (one per line)",
+            "avoid_label": "Please avoid (content, styles, ratings)"},
+    "np": {"label": "NP exchange", "noun": "NP gift",
+           "wants_label": "Items or themes you'd love (NP)",
+           "wants_hint": "What would you love to open? Item types, themes, favorite colors, pets or characters to match.",
+           "links_label": "Wishlist links (one per line)",
+           "avoid_label": "Please avoid (things you dislike)"},
+    "nc": {"label": "NC exchange", "noun": "NC gift",
+           "wants_label": "NC items or themes you'd love",
+           "wants_hint": "Which NC items or themes would you love? Wearables, species or colors you collect, things you already own.",
+           "links_label": "Wishlist links (one per line)",
+           "avoid_label": "Please avoid (items you own, dislikes)"},
+    "other": {"label": "Exchange", "noun": "present",
+              "wants_label": "What would you like?",
+              "wants_hint": "What would make your Santa's job easy?",
+              "links_label": "Links (one per line)",
+              "avoid_label": "Please avoid"},
+}
 
 # ============================================================
-#  DATABASE SETUP
+#  STATE (filled in by setup())
 # ============================================================
 
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+_bot = None
+_get_db_fn = None
+_mod_roles = []
+_guild_names = []
+_mod_channel_name = None
+_claim_attempts = {}            # user id -> times of recent website-code tries
+_last_web_push = {}             # event id -> when the website was last updated
 
 
-def init_db():
-    # Make sure the folders exist (in case the volume isn't mounted yet)
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS art_trade_pool (
-            user_id INTEGER PRIMARY KEY,
-            size TEXT NOT NULL,
-            style TEXT NOT NULL,
-            medium TEXT NOT NULL,
-            character TEXT NOT NULL,
-            match_size INTEGER NOT NULL,
-            match_style INTEGER NOT NULL,
-            match_medium INTEGER NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS commissions (
-            user_id INTEGER PRIMARY KEY,
-            slots INTEGER,
-            where_link TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS food_club_status (
-            date TEXT PRIMARY KEY,
-            outlook TEXT,
-            pinged INTEGER
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS message_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            channel_name TEXT NOT NULL,
-            posted_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_user ON message_log(user_id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_time ON message_log(posted_at)")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS strikes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            strike_type TEXT NOT NULL,
-            reason TEXT NOT NULL,
-            issued_by TEXT NOT NULL,
-            issued_at TEXT NOT NULL,
-            expires_at TEXT
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_strikes_user ON strikes(user_id)")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS activity_thresholds (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            high_threshold REAL NOT NULL,
-            medium_threshold REAL NOT NULL,
-            sample_size INTEGER NOT NULL,
-            computed_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS member_last_seen (
-            user_id INTEGER PRIMARY KEY,
-            last_seen_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS purge_flags (
-            user_id INTEGER PRIMARY KEY,
-            flagged_at TEXT NOT NULL,
-            reason TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS birthdays (
-            user_id INTEGER PRIMARY KEY,
-            birth_month INTEGER NOT NULL,
-            birth_day INTEGER NOT NULL,
-            birth_year INTEGER,
-            set_at TEXT NOT NULL
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS birthday_list_message (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            channel_id INTEGER NOT NULL,
-            message_id INTEGER NOT NULL
-        )
-    """)
-    conn.commit()
-    conn.close()
-    print(f"💾 Database ready at {DB_PATH}")
+def _now():
+    return datetime.now(timezone.utc)
 
 
-def db_add_entry(entry):
-    conn = get_db()
-    conn.execute("""
-        INSERT OR REPLACE INTO art_trade_pool
-        (user_id, size, style, medium, character, match_size, match_style, match_medium)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        entry["user_id"],
-        ",".join(entry["size"]), ",".join(entry["style"]), ",".join(entry["medium"]),
-        entry["character"],
-        0, 0, 0,  # legacy columns, unused now that matching is list-based
-    ))
-    conn.commit()
-    conn.close()
+_FMT = "%Y-%m-%d %H:%M:%S"
 
 
-def db_remove_entry(user_id):
-    conn = get_db()
-    conn.execute("DELETE FROM art_trade_pool WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+def _iso(dt):
+    return dt.astimezone(timezone.utc).strftime(_FMT)
 
 
-def db_load_all_entries():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM art_trade_pool").fetchall()
-    conn.close()
-    entries = {}
-    for row in rows:
-        entries[row["user_id"]] = {
-            "user_id": row["user_id"],
-            "size": row["size"].split(",") if row["size"] else [],
-            "style": row["style"].split(",") if row["style"] else [],
-            "medium": row["medium"].split(",") if row["medium"] else [],
-            "character": row["character"],
-        }
-    return entries
+def _parse(s):
+    return datetime.strptime(s, _FMT).replace(tzinfo=timezone.utc)
 
 
-# --- Commission helpers ---
-
-def db_set_commission(user_id, slots, where_link):
-    conn = get_db()
-    conn.execute("""
-        INSERT OR REPLACE INTO commissions (user_id, slots, where_link)
-        VALUES (?, ?, ?)
-    """, (user_id, slots, where_link))
-    conn.commit()
-    conn.close()
+def _ts(s, style="f"):
+    return f"<t:{int(_parse(s).timestamp())}:{style}>"
 
 
-def db_remove_commission(user_id):
-    conn = get_db()
-    conn.execute("DELETE FROM commissions WHERE user_id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+def _end_of_pacific_day(text):
+    """'2026-12-01' -> 11:59:59 PM Pacific that day, as UTC. Raises ValueError for anything else."""
+    return datetime.strptime(text.strip(), "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59, tzinfo=PACIFIC).astimezone(timezone.utc)
 
 
-def db_get_commission(user_id):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM commissions WHERE user_id = ?", (user_id,)).fetchone()
-    conn.close()
-    if row:
-        return {"user_id": row["user_id"], "slots": row["slots"], "where": row["where_link"]}
-    return None
-
-
-def db_load_all_commissions():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM commissions").fetchall()
-    conn.close()
-    return [{"user_id": row["user_id"], "slots": row["slots"], "where": row["where_link"]} for row in rows]
-
-
-# --- Food Club helpers ---
-
-def db_get_food_club_status(date_str):
-    conn = get_db()
-    row = conn.execute("SELECT * FROM food_club_status WHERE date = ?", (date_str,)).fetchone()
-    conn.close()
-    if row:
-        return {"date": row["date"], "outlook": row["outlook"], "pinged": bool(row["pinged"])}
-    return None
-
-
-def db_set_food_club_status(date_str, outlook, pinged):
-    conn = get_db()
-    conn.execute("""
-        INSERT OR REPLACE INTO food_club_status (date, outlook, pinged)
-        VALUES (?, ?, ?)
-    """, (date_str, outlook, int(pinged)))
-    conn.commit()
-    conn.close()
-
-
-def db_delete_food_club_status(date_str):
-    conn = get_db()
-    conn.execute("DELETE FROM food_club_status WHERE date = ?", (date_str,))
-    conn.commit()
-    conn.close()
+def parse_pacific(text, default_time=(23, 59, 59)):
+    """'2026-12-01' (uses default_time) or '2026-12-01 18:30' or '2026-12-01 6:30 PM', all Pacific time.
+    Returns UTC. Raises ValueError for anything else."""
+    text = " ".join(str(text).strip().upper().split())
+    try:
+        local = datetime.strptime(text, "%Y-%m-%d").replace(hour=default_time[0], minute=default_time[1], second=default_time[2])
+    except ValueError:
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p", "%Y-%m-%d %I %p", "%Y-%m-%d %I%p"):
+            try:
+                local = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            raise ValueError("bad date")
+    return local.replace(tzinfo=PACIFIC).astimezone(timezone.utc)
 
 
 # ============================================================
-#  BOT SETUP
+#  DATABASE
 # ============================================================
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.bans = True  # needed for on_member_ban to fire (not a privileged intent, no portal toggle needed)
+@contextmanager
+def _db():
+    conn = _get_db_fn()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Stores when each user's Active role should expire
-# Format: { user_id: datetime }
-expiry_times = {}
+@contextmanager
+def _txn():
+    """A write transaction that locks the database up front, so two people acting at the same
+    instant can't slip past each other's checks."""
+    conn = _get_db_fn()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.close()
 
-# Track which giveaway messages we've already pinged for (avoid double pinging)
-pinged_giveaways = set()
+
+def init_tables():
+    with _db() as conn:
+        conn.executescript("""
+            CREATE TABLE IF NOT EXISTS st_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'gift',
+                status TEXT NOT NULL DEFAULT 'signups',
+                created_by INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                announce_channel_id INTEGER,
+                announce_message_id INTEGER,
+                signups_close_at TEXT NOT NULL,
+                exchange_by TEXT NOT NULL,
+                budget TEXT,
+                rules TEXT,
+                public_page INTEGER NOT NULL DEFAULT 1,
+                drawn_at TEXT, revealed_at TEXT, closed_at TEXT,
+                reminded_7 INTEGER NOT NULL DEFAULT 0,
+                reminded_2 INTEGER NOT NULL DEFAULT 0,
+                web_dirty INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS st_entries (
+                event_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                display_name TEXT NOT NULL,
+                neopets_name TEXT NOT NULL,
+                wants TEXT NOT NULL DEFAULT '',
+                links TEXT NOT NULL DEFAULT '',
+                avoid TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'discord',
+                joined_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (event_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS st_blocks (
+                event_id INTEGER NOT NULL,
+                user_a INTEGER NOT NULL,
+                user_b INTEGER NOT NULL,
+                PRIMARY KEY (event_id, user_a, user_b)
+            );
+            CREATE TABLE IF NOT EXISTS st_matches (
+                event_id INTEGER NOT NULL,
+                giver_id INTEGER NOT NULL,
+                giftee_id INTEGER NOT NULL,
+                sent_at TEXT,
+                received_at TEXT,
+                thanks TEXT,
+                PRIMARY KEY (event_id, giver_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_st_matches_giftee ON st_matches(event_id, giftee_id);
+            CREATE TABLE IF NOT EXISTS st_lookups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                mod_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                at TEXT NOT NULL
+            );
+        """)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(st_events)").fetchall()}
+        if "opens_at" not in columns:
+            conn.execute("ALTER TABLE st_events ADD COLUMN opens_at TEXT")
+        if "ping_role_id" not in columns:
+            conn.execute("ALTER TABLE st_events ADD COLUMN ping_role_id INTEGER")
+        if "closed_notice" not in columns:
+            conn.execute("ALTER TABLE st_events ADD COLUMN closed_notice INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE st_events SET closed_notice = 1")      # exchanges that already existed don't need a notice
+        conn.commit()
+
+
+# ---------------------------------------------------------------- events
+
+def get_event(event_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM st_events WHERE id = ?", (event_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def active_events(include_scheduled=False):
+    """Every exchange that's currently running, oldest first. Several can run at once.
+    include_scheduled also lists exchanges that are waiting for their opening day."""
+    states = "('signups', 'drawn', 'revealed', 'scheduled')" if include_scheduled else "('signups', 'drawn', 'revealed')"
+    with _db() as conn:
+        rows = conn.execute(f"SELECT * FROM st_events WHERE status IN {states} ORDER BY id").fetchall()
+    return [dict(r) for r in rows]
+
+
+def active_event():
+    """The most recently started running exchange, or None."""
+    events = active_events()
+    return events[-1] if events else None
+
+
+def event_by_message(message_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM st_events WHERE announce_message_id = ?", (message_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def create_event(name, kind, created_by, channel_id, signups_close_at, exchange_by, budget, rules, public_page, now,
+                 opens_at=None, ping_role_id=None):
+    """Returns (True, event_id) or (False, reason). With a future opens_at the exchange waits ('scheduled')
+    and the bot opens it by itself on that day."""
+    scheduled = opens_at is not None and opens_at > now + timedelta(minutes=2)
+    with _txn() as conn:
+        if conn.execute("SELECT 1 FROM st_events WHERE status IN ('signups', 'drawn', 'revealed', 'scheduled') AND LOWER(name) = LOWER(?)",
+                        (name,)).fetchone():
+            return (False, "A running exchange already has that name. Pick a different name so people can tell them apart.")
+        cur = conn.execute(
+            "INSERT INTO st_events (name, kind, status, created_by, created_at, announce_channel_id, signups_close_at, "
+            "exchange_by, budget, rules, public_page, opens_at, ping_role_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, kind if kind in KINDS else "other", "scheduled" if scheduled else "signups", created_by, _iso(now), channel_id,
+             _iso(signups_close_at), _iso(exchange_by), budget, rules, 1 if public_page else 0,
+             _iso(opens_at) if scheduled else None, ping_role_id))
+        return (True, cur.lastrowid)
+
+
+def set_announcement(event_id, channel_id, message_id):
+    with _db() as conn:
+        conn.execute("UPDATE st_events SET announce_channel_id = ?, announce_message_id = ? WHERE id = ?",
+                     (channel_id, message_id, event_id))
+        conn.commit()
+
+
+def mark_dirty(event_id):
+    """The website and the announcement's counts are out of date; the background loop refreshes them."""
+    with _db() as conn:
+        conn.execute("UPDATE st_events SET web_dirty = 1 WHERE id = ?", (event_id,))
+        conn.commit()
+
+
+# ---------------------------------------------------------------- entries
+
+NP_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
+URL_RE = re.compile(r"^https?://\S{3,300}$", re.IGNORECASE)
+
+
+def validate_entry(neopets_name, wants, links, avoid):
+    """Checks and tidies what a member typed (in Discord or on the website).
+    Returns (True, cleaned_dict) or (False, message)."""
+    name = (neopets_name or "").strip()
+    if not NP_NAME_RE.match(name):
+        return (False, "Your Neopets username should be 3 to 20 letters, numbers or underscores.")
+    wants = (wants or "").strip()
+    if not wants:
+        return (False, "Please tell your Santa a little about what you'd like.")
+    if len(wants) > WANTS_MAX:
+        return (False, f"That's a bit long: please keep it under {WANTS_MAX} characters (yours is {len(wants)}).")
+    link_lines = [ln.strip() for ln in (links or "").replace("\r", "").split("\n") if ln.strip()]
+    if len(link_lines) > LINKS_MAX_COUNT:
+        return (False, f"Please share at most {LINKS_MAX_COUNT} links.")
+    for n, ln in enumerate(link_lines, start=1):
+        if not URL_RE.match(ln):
+            return (False, f"Link {n} needs to start with http:// or https:// (one link per line).")
+    avoid = (avoid or "").strip()
+    if len(avoid) > AVOID_MAX:
+        return (False, f"The \"please avoid\" note is too long: keep it under {AVOID_MAX} characters.")
+    return (True, {"neopets_name": name, "wants": wants, "links": "\n".join(link_lines), "avoid": avoid})
+
+
+def entries_for(event_id):
+    with _db() as conn:
+        rows = conn.execute("SELECT * FROM st_entries WHERE event_id = ? ORDER BY joined_at, user_id", (event_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_entry(event_id, user_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM st_entries WHERE event_id = ? AND user_id = ?", (event_id, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_entry(event_id, user_id, display_name, cleaned, source, now):
+    """Adds or updates someone's entry. New people can only join while sign-ups are open; people already
+    in can keep editing their wishlist after the draw. Returns (True, 'created' | 'updated') or (False, reason)."""
+    with _txn() as conn:
+        ev = conn.execute("SELECT * FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("signups", "drawn", "revealed"):
+            return (False, "There's no exchange taking sign-ups right now.")
+        existing = conn.execute("SELECT 1 FROM st_entries WHERE event_id = ? AND user_id = ?", (event_id, user_id)).fetchone()
+        if not existing:
+            if ev["status"] != "signups":
+                return (False, "Sign-ups are closed: the matches have already been drawn.")
+            if now >= _parse(ev["signups_close_at"]):
+                return (False, "Sign-ups have closed.")
+            n = conn.execute("SELECT COUNT(*) AS n FROM st_entries WHERE event_id = ?", (event_id,)).fetchone()["n"]
+            if n >= MAX_PLAYERS:
+                return (False, f"This exchange is full ({MAX_PLAYERS} people).")
+            conn.execute(
+                "INSERT INTO st_entries (event_id, user_id, display_name, neopets_name, wants, links, avoid, source, joined_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (event_id, user_id, display_name, cleaned["neopets_name"], cleaned["wants"], cleaned["links"], cleaned["avoid"],
+                 source, _iso(now), _iso(now)))
+            conn.execute("UPDATE st_events SET web_dirty = 1 WHERE id = ?", (event_id,))
+            return (True, "created")
+        conn.execute(
+            "UPDATE st_entries SET display_name = ?, neopets_name = ?, wants = ?, links = ?, avoid = ?, updated_at = ? "
+            "WHERE event_id = ? AND user_id = ?",
+            (display_name, cleaned["neopets_name"], cleaned["wants"], cleaned["links"], cleaned["avoid"], _iso(now), event_id, user_id))
+        return (True, "updated")
+
+
+def leave_event(event_id, user_id):
+    """Someone withdraws before the draw."""
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] != "signups":
+            return (False, "The matches have already been drawn, so ask a mod to remove you.")
+        cur = conn.execute("DELETE FROM st_entries WHERE event_id = ? AND user_id = ?", (event_id, user_id))
+        if cur.rowcount == 0:
+            return (False, "You're not signed up.")
+        conn.execute("UPDATE st_events SET web_dirty = 1 WHERE id = ?", (event_id,))
+        return (True, "ok")
+
+
+# ---------------------------------------------------------------- blocked pairs
+
+def _pair(a, b):
+    return (a, b) if a < b else (b, a)
+
+
+def add_block(event_id, a, b):
+    if a == b:
+        return (False, "Pick two different members.")
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("scheduled", "signups"):
+            return (False, "Pairs can only be blocked before the draw.")
+        x, y = _pair(a, b)
+        conn.execute("INSERT OR IGNORE INTO st_blocks (event_id, user_a, user_b) VALUES (?, ?, ?)", (event_id, x, y))
+        return (True, "ok")
+
+
+def remove_block(event_id, a, b):
+    with _txn() as conn:
+        x, y = _pair(a, b)
+        cur = conn.execute("DELETE FROM st_blocks WHERE event_id = ? AND user_a = ? AND user_b = ?", (event_id, x, y))
+        return (True, "ok") if cur.rowcount else (False, "Those two weren't blocked.")
+
+
+def blocked_pairs(event_id):
+    with _db() as conn:
+        rows = conn.execute("SELECT user_a, user_b FROM st_blocks WHERE event_id = ?", (event_id,)).fetchall()
+    return {frozenset((r["user_a"], r["user_b"])) for r in rows}
+
 
 # ============================================================
-#  ART TRADE POOL (loaded from SQLite on startup, kept in memory + synced)
+#  THE DRAW
 # ============================================================
 
-art_trade_pool = {}  # populated in on_ready via db_load_all_entries()
-
-SIZE_CHOICES = ["Headshot", "Fullbody", "Full Scene"]
-STYLE_CHOICES = ["Anthro", "Quad", "Human", "Other"]
-MEDIUM_CHOICES = ["Digital", "Traditional"]
+class DrawImpossible(Exception):
+    pass
 
 
-def entries_match(a, b):
-    """Two entries match if EVERY field has at least one overlapping option."""
-    if a["user_id"] == b["user_id"]:
+def _allowed(a, b, blocked):
+    return a != b and frozenset((a, b)) not in blocked
+
+
+def _search(ids, blocked, rng, mutual_ok, node_limit=200000):
+    """Backtracking search for a valid draw (used only when a simple shuffle can't satisfy the blocked pairs)."""
+    order = sorted(ids, key=lambda x: (sum(1 for y in ids if not _allowed(x, y, blocked)), rng.random()), reverse=True)
+    assignment, taken, nodes = {}, set(), [0]
+
+    def rec(i):
+        if i == len(order):
+            return True
+        nodes[0] += 1
+        if nodes[0] > node_limit:
+            return False
+        giver = order[i]
+        options = [t for t in ids if t not in taken and _allowed(giver, t, blocked) and (mutual_ok or assignment.get(t) != giver)]
+        rng.shuffle(options)
+        for target in options:
+            assignment[giver] = target
+            taken.add(target)
+            if rec(i + 1):
+                return True
+            del assignment[giver]
+            taken.discard(target)
         return False
 
-    if not set(a["size"]) & set(b["size"]):
-        return False
-    if not set(a["style"]) & set(b["style"]):
-        return False
-    if not set(a["medium"]) & set(b["medium"]):
+    return dict(assignment) if rec(0) else None
+
+
+def compute_matches(ids, blocked, rng=None, avoid_mutual=True):
+    """Works out who gives to whom. Returns {giver_id: giftee_id}.
+    Rules: nobody gets themselves; blocked pairs are never matched (in either direction); and, whenever it's
+    possible, nobody ends up swapping with the person who has them (A->B and B->A), which would give the
+    surprise away. Raises DrawImpossible if the rules can't all be met."""
+    rng = rng or random.Random()
+    ids = list(ids)
+    n = len(ids)
+    if n < MIN_PLAYERS:
+        raise DrawImpossible(f"An exchange needs at least {MIN_PLAYERS} people.")
+    # 1) one big circle: everyone gives to the next person. It can never contain a swap.
+    for _ in range(400):
+        order = ids[:]
+        rng.shuffle(order)
+        if all(_allowed(order[i], order[(i + 1) % n], blocked) for i in range(n)):
+            return {order[i]: order[(i + 1) % n] for i in range(n)}
+    # 2) the blocked pairs make a circle hard, so search more carefully
+    for mutual_ok in ((False, True) if avoid_mutual else (True,)):
+        result = _search(ids, blocked, rng, mutual_ok)
+        if result:
+            return result
+    raise DrawImpossible("There's no way to match everyone with those blocked pairs. Remove a block and try again.")
+
+
+def draw_event(event_id, now, rng=None):
+    """Draws the matches. Returns (True, info) or (False, reason)."""
+    with _txn() as conn:
+        ev = conn.execute("SELECT * FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] != "signups":
+            return (False, "This exchange isn't taking sign-ups, so it can't be drawn.")
+        ids = [r["user_id"] for r in conn.execute("SELECT user_id FROM st_entries WHERE event_id = ?", (event_id,)).fetchall()]
+        if len(ids) < MIN_PLAYERS:
+            return (False, f"Only {len(ids)} signed up. An exchange needs at least {MIN_PLAYERS}.")
+        blocks = {frozenset((r["user_a"], r["user_b"])) for r in
+                  conn.execute("SELECT user_a, user_b FROM st_blocks WHERE event_id = ?", (event_id,)).fetchall()}
+        try:
+            matches = compute_matches(ids, blocks, rng)
+        except DrawImpossible as e:
+            return (False, str(e))
+        for giver, giftee in matches.items():
+            conn.execute("INSERT INTO st_matches (event_id, giver_id, giftee_id) VALUES (?, ?, ?)", (event_id, giver, giftee))
+        conn.execute("UPDATE st_events SET status = 'drawn', drawn_at = ?, web_dirty = 1 WHERE id = ?", (_iso(now), event_id))
+        return (True, {"players": len(ids)})
+
+
+# ============================================================
+#  AFTER THE DRAW
+# ============================================================
+
+def giftee_of(event_id, user_id):
+    """The person this member gives to (their entry), or None."""
+    with _db() as conn:
+        row = conn.execute(
+            "SELECT e.* FROM st_matches m JOIN st_entries e ON e.event_id = m.event_id AND e.user_id = m.giftee_id "
+            "WHERE m.event_id = ? AND m.giver_id = ?", (event_id, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def match_row_as_giver(event_id, user_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM st_matches WHERE event_id = ? AND giver_id = ?", (event_id, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def match_row_as_giftee(event_id, user_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM st_matches WHERE event_id = ? AND giftee_id = ?", (event_id, user_id)).fetchone()
+    return dict(row) if row else None
+
+
+def mark_sent(event_id, user_id, now, undo=False):
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("drawn", "revealed"):
+            return (False, "The matches haven't been drawn yet.")
+        row = conn.execute("SELECT * FROM st_matches WHERE event_id = ? AND giver_id = ?", (event_id, user_id)).fetchone()
+        if not row:
+            return (False, "You're not part of this exchange.")
+        if undo:
+            conn.execute("UPDATE st_matches SET sent_at = NULL WHERE event_id = ? AND giver_id = ?", (event_id, user_id))
+            conn.execute("UPDATE st_events SET web_dirty = 1 WHERE id = ?", (event_id,))
+            return (True, "unmarked")
+        if row["sent_at"]:
+            return (True, "already")
+        conn.execute("UPDATE st_matches SET sent_at = ? WHERE event_id = ? AND giver_id = ?", (_iso(now), event_id, user_id))
+        conn.execute("UPDATE st_events SET web_dirty = 1 WHERE id = ?", (event_id,))
+        return (True, "marked")
+
+
+def mark_received(event_id, user_id, now, thanks=None):
+    """The receiver confirms their gift arrived; an optional thank-you note is shown at the reveal."""
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("drawn", "revealed"):
+            return (False, "The matches haven't been drawn yet.")
+        row = conn.execute("SELECT * FROM st_matches WHERE event_id = ? AND giftee_id = ?", (event_id, user_id)).fetchone()
+        if not row:
+            return (False, "You're not part of this exchange.")
+        thanks = (thanks or "").strip()[:THANKS_MAX] or None
+        already = row["received_at"] is not None
+        conn.execute("UPDATE st_matches SET received_at = COALESCE(received_at, ?), thanks = COALESCE(?, thanks) "
+                     "WHERE event_id = ? AND giftee_id = ?", (_iso(now), thanks, event_id, user_id))
+        conn.execute("UPDATE st_events SET web_dirty = 1 WHERE id = ?", (event_id,))
+        return (True, "already" if already else "marked")
+
+
+def counts(event_id):
+    with _db() as conn:
+        entries = conn.execute("SELECT COUNT(*) AS n FROM st_entries WHERE event_id = ?", (event_id,)).fetchone()["n"]
+        row = conn.execute("SELECT COUNT(*) AS matched, COUNT(sent_at) AS sent, COUNT(received_at) AS received "
+                           "FROM st_matches WHERE event_id = ?", (event_id,)).fetchone()
+    return {"signed_up": entries, "matched": row["matched"], "sent": row["sent"], "received": row["received"]}
+
+
+def givers_not_sent(event_id):
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT m.giver_id, e.display_name FROM st_matches m JOIN st_entries e ON e.event_id = m.event_id AND e.user_id = m.giver_id "
+            "WHERE m.event_id = ? AND m.sent_at IS NULL ORDER BY e.display_name", (event_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def lookup_match(event_id, mod_id, target_id, now):
+    """An emergency look-up by a mod: who has this member, and who they have. Always recorded."""
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("drawn", "revealed"):
+            return (False, "The matches haven't been drawn yet.")
+        if not conn.execute("SELECT 1 FROM st_entries WHERE event_id = ? AND user_id = ?", (event_id, target_id)).fetchone():
+            return (False, "That member isn't in this exchange.")
+        conn.execute("INSERT INTO st_lookups (event_id, mod_id, target_id, at) VALUES (?, ?, ?, ?)",
+                     (event_id, mod_id, target_id, _iso(now)))
+        santa = conn.execute("SELECT e.display_name FROM st_matches m JOIN st_entries e ON e.event_id = m.event_id AND e.user_id = m.giver_id "
+                             "WHERE m.event_id = ? AND m.giftee_id = ?", (event_id, target_id)).fetchone()
+        giftee = conn.execute("SELECT e.display_name FROM st_matches m JOIN st_entries e ON e.event_id = m.event_id AND e.user_id = m.giftee_id "
+                              "WHERE m.event_id = ? AND m.giver_id = ?", (event_id, target_id)).fetchone()
+        n = conn.execute("SELECT COUNT(*) AS n FROM st_lookups WHERE event_id = ?", (event_id,)).fetchone()["n"]
+        return (True, {"santa": santa["display_name"] if santa else None,
+                       "giftee": giftee["display_name"] if giftee else None, "lookup_number": n})
+
+
+def drop_participant(event_id, user_id):
+    """Removes someone, and after the draw repairs the matches. If S gave to the person leaving (D) and D gave
+    to G, then S now gives to G. If that isn't allowed, one other pair is swapped to make it work.
+    Returns a dict describing what happened, or (False, reason)."""
+    with _txn() as conn:
+        ev = conn.execute("SELECT * FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("signups", "drawn"):
+            return (False, "People can only be removed before the reveal.")
+        entry = conn.execute("SELECT * FROM st_entries WHERE event_id = ? AND user_id = ?", (event_id, user_id)).fetchone()
+        if not entry:
+            return (False, "That member isn't in this exchange.")
+        conn.execute("UPDATE st_events SET web_dirty = 1 WHERE id = ?", (event_id,))
+        if ev["status"] == "signups":
+            conn.execute("DELETE FROM st_entries WHERE event_id = ? AND user_id = ?", (event_id, user_id))
+            return {"phase": "signups", "repaired": True, "notify": []}
+
+        blocks = {frozenset((r["user_a"], r["user_b"])) for r in
+                  conn.execute("SELECT user_a, user_b FROM st_blocks WHERE event_id = ?", (event_id,)).fetchall()}
+        m_in = conn.execute("SELECT * FROM st_matches WHERE event_id = ? AND giftee_id = ?", (event_id, user_id)).fetchone()   # S -> D
+        m_out = conn.execute("SELECT * FROM st_matches WHERE event_id = ? AND giver_id = ?", (event_id, user_id)).fetchone()   # D -> G
+        conn.execute("DELETE FROM st_matches WHERE event_id = ? AND (giver_id = ? OR giftee_id = ?)", (event_id, user_id, user_id))
+        conn.execute("DELETE FROM st_entries WHERE event_id = ? AND user_id = ?", (event_id, user_id))
+        if not m_in or not m_out:
+            return {"phase": "drawn", "repaired": True, "notify": []}
+        S, G = m_in["giver_id"], m_out["giftee_id"]
+        had_sent = m_in["sent_at"] is not None
+        if S == G:
+            return {"phase": "drawn", "repaired": False, "orphan": S, "reason": "the two of them were only matched with each other"}
+        if _allowed(S, G, blocks):
+            conn.execute("INSERT INTO st_matches (event_id, giver_id, giftee_id) VALUES (?, ?, ?)", (event_id, S, G))
+            return {"phase": "drawn", "repaired": True, "notify": [S], "had_sent": had_sent}
+        # S can't give to G: look for another pair (X -> Y) to swap with, so that S -> Y and X -> G are both allowed
+        others = conn.execute("SELECT * FROM st_matches WHERE event_id = ?", (event_id,)).fetchall()
+        for pair in others:
+            X, Y = pair["giver_id"], pair["giftee_id"]
+            if X in (S, G) or Y in (S, G):
+                continue
+            if _allowed(S, Y, blocks) and _allowed(X, G, blocks):
+                conn.execute("DELETE FROM st_matches WHERE event_id = ? AND giver_id = ?", (event_id, X))
+                conn.execute("INSERT INTO st_matches (event_id, giver_id, giftee_id) VALUES (?, ?, ?)", (event_id, S, Y))
+                conn.execute("INSERT INTO st_matches (event_id, giver_id, giftee_id) VALUES (?, ?, ?)", (event_id, X, G))
+                return {"phase": "drawn", "repaired": True, "notify": [S, X], "had_sent": had_sent, "swapped": True}
+        return {"phase": "drawn", "repaired": False, "stuck": (S, G), "reason": "a blocked pair stops them being matched and no swap fixes it"}
+
+
+def reveal_event(event_id, now):
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] != "drawn":
+            return (False, "Only an exchange that has been drawn can be revealed.")
+        conn.execute("UPDATE st_events SET status = 'revealed', revealed_at = ?, web_dirty = 1 WHERE id = ?", (_iso(now), event_id))
+        return (True, "ok")
+
+
+def close_event(event_id, now):
+    """Ends the exchange and erases everyone's wishlists, links and notes."""
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("signups", "drawn", "revealed"):
+            return (False, "That exchange has already ended.")
+        conn.execute("UPDATE st_events SET status = 'closed', closed_at = ?, web_dirty = 1 WHERE id = ?", (_iso(now), event_id))
+        conn.execute("UPDATE st_entries SET wants = '', links = '', avoid = '' WHERE event_id = ?", (event_id,))
+        return (True, "ok")
+
+
+def reschedule_event(event_id, now, opens_at=None, close_at=None, due_at=None):
+    """Changes an exchange's dates. opens_at only while it's waiting to open; close_at until it's drawn; due_at until it ends.
+    Returns (True, event) or (False, reason)."""
+    with _txn() as conn:
+        row = conn.execute("SELECT * FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not row or row["status"] not in ("scheduled", "signups", "drawn"):
+            return (False, "That exchange can't have its dates changed any more.")
+        ev = dict(row)
+        status = ev["status"]
+        if opens_at is not None and status != "scheduled":
+            return (False, "Sign-ups have already opened, so the opening time can't be changed.")
+        if close_at is not None and status == "drawn":
+            return (False, "The matches are already drawn, so sign-ups can't be reopened. You can still change the due date.")
+        new_open = opens_at if opens_at is not None else (_parse(ev["opens_at"]) if ev["opens_at"] else None)
+        new_close = close_at if close_at is not None else _parse(ev["signups_close_at"])
+        new_due = due_at if due_at is not None else _parse(ev["exchange_by"])
+        if status in ("scheduled", "signups") and close_at is not None and new_close <= now + timedelta(minutes=5):
+            return (False, "The new sign-up deadline has to be in the future.")
+        if status == "scheduled" and new_open is not None and new_open >= new_close - timedelta(hours=1):
+            return (False, "Sign-ups need to open before they close (with at least an hour to spare).")
+        if new_due <= new_close:
+            return (False, "Gifts must be due after sign-ups close.")
+        if status == "drawn" and due_at is not None and new_due <= now + timedelta(minutes=5):
+            return (False, "The new due date has to be in the future.")
+        sets, args = ["web_dirty = 1"], []
+        if opens_at is not None:
+            sets.append("opens_at = ?"); args.append(_iso(opens_at))
+        if close_at is not None:
+            sets.append("signups_close_at = ?"); args.append(_iso(close_at))
+            sets.append("closed_notice = 0")                 # if it had closed, the closing note is due again
+        if due_at is not None:
+            sets.append("exchange_by = ?"); args.append(_iso(due_at))
+            # reminders that haven't come due under the new date can fire again
+            if now < new_due - timedelta(days=REMINDER_DAYS[0]):
+                sets.append("reminded_7 = 0")
+            if now < new_due - timedelta(days=REMINDER_DAYS[1]):
+                sets.append("reminded_2 = 0")
+        conn.execute(f"UPDATE st_events SET {', '.join(sets)} WHERE id = ?", (*args, event_id))
+        return (True, dict(conn.execute("SELECT * FROM st_events WHERE id = ?", (event_id,)).fetchone()))
+
+
+def cancel_event(event_id, now):
+    with _txn() as conn:
+        ev = conn.execute("SELECT status FROM st_events WHERE id = ?", (event_id,)).fetchone()
+        if not ev or ev["status"] not in ("signups", "scheduled"):
+            return (False, "Only an exchange that hasn't been drawn can be cancelled. Use /santa close for the rest.")
+        conn.execute("UPDATE st_events SET status = 'cancelled', closed_at = ?, web_dirty = 1 WHERE id = ?", (_iso(now), event_id))
+        conn.execute("UPDATE st_entries SET wants = '', links = '', avoid = '' WHERE event_id = ?", (event_id,))
+        return (True, "ok")
+
+
+def reveal_pairs(event_id):
+    """Who had whom, with any thank-you note. Only used for the reveal."""
+    with _db() as conn:
+        rows = conn.execute(
+            "SELECT g.display_name AS giver_name, g.neopets_name AS giver_np, r.display_name AS giftee_name, "
+            "r.neopets_name AS giftee_np, m.thanks AS note FROM st_matches m "
+            "JOIN st_entries g ON g.event_id = m.event_id AND g.user_id = m.giver_id "
+            "JOIN st_entries r ON r.event_id = m.event_id AND r.user_id = m.giftee_id "
+            "WHERE m.event_id = ? ORDER BY g.display_name", (event_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ============================================================
+#  SMALL DISCORD HELPERS
+# ============================================================
+
+def _is_mod(user):
+    return any(r.name in _mod_roles for r in getattr(user, "roles", []))
+
+
+async def _deny_wrong_guild(interaction):
+    if interaction.guild is None or interaction.guild.name not in _guild_names:
+        await interaction.response.send_message("⚠️ Secret Santa isn't active in this server.", ephemeral=True)
+        return True
+    return False
+
+
+async def _deny_non_mod(interaction):
+    if not _is_mod(interaction.user):
+        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+        return True
+    return False
+
+
+def web_enabled():
+    return bool(WEB_SYNC_URL) and bool(os.environ.get(WEB_SECRET_ENV))
+
+
+def web_link(event):
+    if not web_enabled() or not event.get("public_page"):
+        return None
+    return WEB_PUBLIC_URL.rstrip("/") + "/?e=" + str(event["id"])
+
+
+async def _get_channel(channel_id):
+    if not channel_id:
+        return None
+    channel = _bot.get_channel(channel_id)
+    if channel is None:
+        try:
+            channel = await _bot.fetch_channel(channel_id)
+        except Exception:
+            channel = None
+    return channel
+
+
+async def _dm(user_id, content):
+    """Best-effort private message. Returns True if it was delivered."""
+    try:
+        user = _bot.get_user(user_id) or await _bot.fetch_user(user_id)
+        await user.send(content)
+        return True
+    except Exception:
         return False
 
+
+async def _mod_log(text):
+    """Writes to the mod channel. Returns True if it was posted."""
+    try:
+        guild = discord.utils.get(_bot.guilds, name=_guild_names[0])
+        channel = discord.utils.get(guild.text_channels, name=_mod_channel_name) if guild is not None and _mod_channel_name else None
+        if channel is None:
+            print("⚠️ Santa: couldn't find the mod channel to log to")
+            return False
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        return True
+    except Exception as e:
+        print(f"⚠️ Santa: couldn't write to the mod channel ({type(e).__name__})")
+        return False
+
+
+def _kind(event):
+    return KINDS.get(event["kind"], KINDS["other"])
+
+
+# ============================================================
+#  THE ANNOUNCEMENT POST AND ITS BUTTONS
+# ============================================================
+
+def announcement_embed(event):
+    kind = _kind(event)
+    c = counts(event["id"])
+    status = event["status"]
+    embed = discord.Embed(title=f"🎅 {event['name']}", color=EMBED_COLOR)
+    lines = []
+    if status == "signups" and _now() >= _parse(event["signups_close_at"]):
+        lines.append("🔒 **Sign-ups are closed.** The matches will be drawn soon!")
+    elif status == "signups":
+        lines.append(f"Join our **{kind['label'].lower()}**! You'll be matched with one person to give a {kind['noun']} to, "
+                     f"and one other person will be giving to you. Nobody finds out who until the reveal.")
+        lines.append(f"**Sign-ups close:** {_ts(event['signups_close_at'], 'F')} ({_ts(event['signups_close_at'], 'R')})")
+    elif status == "drawn":
+        lines.append("🎉 **The matches are out!** Press **🎅 My giftee** to see who you're giving to. Only you can see it.")
+    elif status == "revealed":
+        lines.append("🎊 **The reveal is here!** Thank you to everyone who took part.")
+    else:
+        lines.append("This exchange has ended. Thank you to everyone who took part! 💝")
+    if status in ("signups", "drawn"):
+        lines.append(f"**{kind['noun'].capitalize()}s due by:** {_ts(event['exchange_by'], 'F')} ({_ts(event['exchange_by'], 'R')})")
+    if event.get("budget"):
+        lines.append(f"**Guidelines:** {event['budget']}")
+    if event.get("rules"):
+        lines.append(f"**Rules:** {event['rules']}")
+    link = web_link(event)
+    if link:
+        lines.append("🌐 Event page" + (" and website sign-up" if status == "signups" else "") + f": {link}")
+    embed.description = "\n\n".join(lines)[:4000]
+    if status == "signups":
+        embed.add_field(name="Signed up", value=str(c["signed_up"]), inline=True)
+    elif status in ("drawn", "revealed"):
+        embed.add_field(name="Players", value=str(c["matched"]), inline=True)
+        embed.add_field(name="Sent", value=f"{c['sent']} / {c['matched']}", inline=True)
+        embed.add_field(name="Received", value=f"{c['received']} / {c['matched']}", inline=True)
+    embed.set_footer(text="Your match is secret: only you can see it.")
+    return embed
+
+
+async def post_announcement(event, channel):
+    """Posts the announcement (with its buttons). Pings the chosen role, if there is one. Raises if it can't post."""
+    role_id = event.get("ping_role_id")
+    text = (f"<@&{role_id}> " if role_id else "") + f"🎄 **{event['name']}**: sign-ups are open until {_ts(event['signups_close_at'], 'F')}!"
+    mentions = discord.AllowedMentions(everyone=False, users=False, roles=[discord.Object(id=role_id)] if role_id else False)
+    return await channel.send(content=text, embed=announcement_embed(event), view=SantaView(), allowed_mentions=mentions)
+
+
+async def refresh_announcement(event_id):
+    event = get_event(event_id)
+    if not event or not event["announce_message_id"]:
+        return
+    try:
+        channel = await _get_channel(event["announce_channel_id"])
+        message = await channel.fetch_message(event["announce_message_id"])
+        await message.edit(embed=announcement_embed(event), view=SantaView())
+    except Exception as e:
+        print(f"⚠️ Santa: couldn't refresh the announcement ({type(e).__name__})")
+
+
+class SantaView(discord.ui.View):
+    """The buttons under the announcement. They keep working after restarts because the exchange is looked
+    up from the message the button is on."""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _event(self, interaction):
+        event = event_by_message(interaction.message.id) if interaction.message else None
+        if event is None:
+            await interaction.response.send_message("⚠️ This exchange has ended.", ephemeral=True)
+        return event
+
+    @discord.ui.button(label="Join / edit my entry", style=discord.ButtonStyle.success, emoji="🎁", custom_id="st_join", row=0)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        event = await self._event(interaction)
+        if event:
+            await open_entry_form(interaction, event)
+
+    @discord.ui.button(label="My giftee", style=discord.ButtonStyle.primary, emoji="🎅", custom_id="st_match", row=0)
+    async def match(self, interaction: discord.Interaction, button: discord.ui.Button):
+        event = await self._event(interaction)
+        if event:
+            await show_match(interaction, event)
+
+    @discord.ui.button(label="I sent my gift", style=discord.ButtonStyle.secondary, emoji="📦", custom_id="st_sent", row=1)
+    async def sent(self, interaction: discord.Interaction, button: discord.ui.Button):
+        event = await self._event(interaction)
+        if event:
+            await do_mark_sent(interaction, event)
+
+    @discord.ui.button(label="I got my gift", style=discord.ButtonStyle.secondary, emoji="💌", custom_id="st_received", row=1)
+    async def received(self, interaction: discord.Interaction, button: discord.ui.Button):
+        event = await self._event(interaction)
+        if event:
+            await open_received_form(interaction, event)
+
+
+# ---------------------------------------------------------------- the sign-up form
+
+class EntryModal(discord.ui.Modal):
+    def __init__(self, event, existing=None):
+        super().__init__(title=f"Entry: {event['name']}"[:45])
+        self.event_id = event["id"]
+        kind = _kind(event)
+        self.neopets = discord.ui.TextInput(label="Your Neopets username", required=True, min_length=3, max_length=20,
+                                            default=(existing or {}).get("neopets_name") or None)
+        self.wants = discord.ui.TextInput(label=kind["wants_label"][:45], style=discord.TextStyle.paragraph, required=True,
+                                          max_length=WANTS_MAX, placeholder=kind["wants_hint"][:100],
+                                          default=(existing or {}).get("wants") or None)
+        self.links = discord.ui.TextInput(label=kind["links_label"][:45], style=discord.TextStyle.paragraph, required=False,
+                                          max_length=LINKS_MAX_COUNT * 120, placeholder="https://...",
+                                          default=(existing or {}).get("links") or None)
+        self.avoid = discord.ui.TextInput(label=kind["avoid_label"][:45], style=discord.TextStyle.paragraph, required=False,
+                                          max_length=AVOID_MAX, default=(existing or {}).get("avoid") or None)
+        for item in (self.neopets, self.wants, self.links, self.avoid):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ok, cleaned = validate_entry(self.neopets.value, self.wants.value, self.links.value, self.avoid.value)
+        if not ok:
+            await interaction.response.send_message(f"⚠️ {cleaned}\nPress the 🎁 button to try again. Nothing was saved.", ephemeral=True)
+            return
+        ok, result = upsert_entry(self.event_id, interaction.user.id, interaction.user.display_name, cleaned, "discord", _now())
+        if not ok:
+            await interaction.response.send_message(f"⚠️ {result}", ephemeral=True)
+            return
+        await interaction.response.send_message(_entry_saved_text(result), ephemeral=True)
+
+
+def _entry_saved_text(result):
+    if result == "created":
+        return ("🎁 **You're in!** Your Santa will see this when matches are drawn. "
+                "You can change it any time with the 🎁 button or `/santa join`.")
+    return "✅ Your entry was updated."
+
+
+async def open_entry_form(interaction, event):
+    if await _deny_wrong_guild(interaction):
+        return
+    if getattr(interaction.user, "bot", False):
+        await interaction.response.send_message("⚠️ Bots can't take part.", ephemeral=True)
+        return
+    existing = get_entry(event["id"], interaction.user.id)
+    if event["status"] in ("closed", "cancelled") or (event["status"] == "revealed" and not existing):
+        await interaction.response.send_message("⚠️ This exchange isn't taking sign-ups." if event["status"] != "closed"
+                                                else "This exchange has ended. Thank you for taking part! 💝", ephemeral=True)
+        return
+    if not existing:
+        if event["status"] != "signups":
+            await interaction.response.send_message("⚠️ Sign-ups are closed: the matches have already been drawn.", ephemeral=True)
+            return
+        if _now() >= _parse(event["signups_close_at"]):
+            await interaction.response.send_message("⚠️ Sign-ups have closed.", ephemeral=True)
+            return
+    await interaction.response.send_modal(EntryModal(event, existing))
+
+
+# ---------------------------------------------------------------- my giftee
+
+class SentView(discord.ui.View):
+    def __init__(self, event_id, user_id):
+        super().__init__(timeout=900)
+        self.event_id, self.user_id = event_id, user_id
+
+    @discord.ui.button(label="I sent my gift", style=discord.ButtonStyle.success, emoji="📦")
+    async def sent(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("⚠️ This belongs to someone else.", ephemeral=True)
+            return
+        ok, result = mark_sent(self.event_id, interaction.user.id, _now())
+        await interaction.response.send_message(_sent_text(ok, result), ephemeral=True)
+
+
+def _sent_text(ok, result):
+    if not ok:
+        return f"⚠️ {result}"
+    return {"marked": "📦 Marked as sent. Thank you!", "already": "You'd already marked your gift as sent. Thank you!",
+            "unmarked": "Okay, your gift is marked as not sent yet."}[result]
+
+
+def _match_embed(event, giftee, giver_row):
+    kind = _kind(event)
+    embed = discord.Embed(title=f"🎅 You're the Secret Santa for {giftee['display_name']}!", color=EMBED_COLOR)
+    embed.description = f"**{event['name']}**\nTheir Neopets username: **{giftee['neopets_name']}**"
+    embed.add_field(name=kind["wants_label"][:256], value=(giftee["wants"] or "—")[:1024], inline=False)
+    if giftee["links"]:
+        embed.add_field(name="Links", value=giftee["links"][:1024], inline=False)
+    if giftee["avoid"]:
+        embed.add_field(name="Please avoid", value=giftee["avoid"][:1024], inline=False)
+    embed.add_field(name="Due by", value=_ts(event["exchange_by"], "F"), inline=False)
+    if event.get("budget"):
+        embed.add_field(name="Guidelines", value=event["budget"][:1024], inline=False)
+    state = "📦 You've marked your gift as sent." if giver_row["sent_at"] else "You haven't marked your gift as sent yet."
+    embed.set_footer(text=f"{state} Keep it secret! 🤫")
+    return embed
+
+
+async def show_match(interaction, event):
+    if await _deny_wrong_guild(interaction):
+        return
+    user = interaction.user
+    if event["status"] == "signups":
+        await interaction.response.send_message("🎅 The matches haven't been drawn yet. Hang tight!", ephemeral=True)
+        return
+    if event["status"] in ("closed", "cancelled"):
+        await interaction.response.send_message("This exchange has ended. Thank you for taking part! 💝", ephemeral=True)
+        return
+    row = match_row_as_giver(event["id"], user.id)
+    giftee = giftee_of(event["id"], user.id)
+    if not row or not giftee:
+        mine = get_entry(event["id"], user.id)
+        await interaction.response.send_message(
+            "⚠️ You're signed up, but you don't have a match." if mine else "⚠️ You're not part of this exchange.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=_match_embed(event, giftee, row), view=SentView(event["id"], user.id), ephemeral=True)
+
+
+async def do_mark_sent(interaction, event, undo=False):
+    if await _deny_wrong_guild(interaction):
+        return
+    ok, result = mark_sent(event["id"], interaction.user.id, _now(), undo=undo)
+    await interaction.response.send_message(f"**{event['name']}**: " + _sent_text(ok, result), ephemeral=True)
+
+
+class ReceivedModal(discord.ui.Modal):
+    def __init__(self, event_id):
+        super().__init__(title="Your gift arrived!")
+        self.event_id = event_id
+        self.thanks = discord.ui.TextInput(label="Thank-you note (shown at reveal; optional)", style=discord.TextStyle.paragraph,
+                                           required=False, max_length=THANKS_MAX, placeholder="Say thanks to your Santa!")
+        self.add_item(self.thanks)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ok, result = mark_received(self.event_id, interaction.user.id, _now(), self.thanks.value)
+        if not ok:
+            await interaction.response.send_message(f"⚠️ {result}", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "💌 Marked as received. Your Santa will be so happy!" if result == "marked" else "✅ Updated your thank-you note.", ephemeral=True)
+
+
+async def open_received_form(interaction, event):
+    if await _deny_wrong_guild(interaction):
+        return
+    if event["status"] not in ("drawn", "revealed"):
+        await interaction.response.send_message("⚠️ The matches haven't been drawn yet." if event["status"] == "signups"
+                                                else "This exchange has ended.", ephemeral=True)
+        return
+    if not match_row_as_giftee(event["id"], interaction.user.id):
+        await interaction.response.send_message("⚠️ You're not part of this exchange.", ephemeral=True)
+        return
+    await interaction.response.send_modal(ReceivedModal(event["id"]))
+
+
+# ============================================================
+#  THE WEBSITE: public page, and sign-ups made there
+# ============================================================
+
+def build_web_payload(event):
+    """Exactly what's sent to the website: event info and COUNTS. Wishlists, links and matches are never
+    sent. Only after a mod runs /santa reveal are the pairs (and thank-you notes) included."""
+    payload = {
+        "event": {
+            "id": event["id"], "name": event["name"], "kind": event["kind"], "status": event["status"],
+            "signups_close_at": _parse(event["signups_close_at"]).isoformat(),
+            "exchange_by": _parse(event["exchange_by"]).isoformat(),
+            "budget": event["budget"], "rules": event["rules"],
+            "counts": counts(event["id"]),
+        },
+        "reveal": [],
+    }
+    if event["status"] in ("revealed", "closed"):
+        payload["reveal"] = reveal_pairs(event["id"])
+    return payload
+
+
+async def push_web(event_id):
+    """Sends the event to the website. Never raises: a website problem must never get in the way of an exchange."""
+    if not web_enabled():
+        return False
+    event = get_event(event_id)
+    if not event or not event["public_page"]:
+        return False
+    try:
+        payload = build_web_payload(event)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(WEB_SYNC_URL, json=payload, headers={"X-Sync-Secret": os.environ.get(WEB_SECRET_ENV, "")},
+                                    timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                try:
+                    result = await resp.json(content_type=None)
+                except Exception:
+                    result = {}
+                ok = resp.status == 200 and isinstance(result, dict) and bool(result.get("success"))
+                problem = (result.get("error") if isinstance(result, dict) else None) or f"HTTP {resp.status}"
+    except Exception as e:
+        print(f"⚠️ Santa: couldn't reach the website ({type(e).__name__})")
+        return False
+    if not ok:
+        print(f"⚠️ Santa: the website rejected the update ({problem})")
+        return False
+    _last_web_push[event_id] = time.monotonic()
+    with _db() as conn:
+        conn.execute("UPDATE st_events SET web_dirty = 0 WHERE id = ?", (event_id,))
+        conn.commit()
     return True
 
 
-def format_list(values):
-    return ", ".join(values)
+def _normalize_code(code):
+    return re.sub(r"[^A-Za-z0-9]", "", code or "").upper()
 
 
-class MatchConfirmView(discord.ui.View):
-    """Buttons shown in the DM asking a user to confirm or decline the match."""
+async def claim_web_signup(code):
+    """Collects a website sign-up using its code. The website deletes its copy as soon as it's collected.
+    Returns (True, entry_dict) or (False, message)."""
+    if not web_enabled():
+        return (False, "Website sign-ups aren't set up.")
+    code = _normalize_code(code)
+    if len(code) != 8:
+        return (False, "That code doesn't look right. It's 8 letters and numbers, like `K7M2-9QPX`.")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(WEB_CLAIM_URL, json={"code": code}, headers={"X-Sync-Secret": os.environ.get(WEB_SECRET_ENV, "")},
+                                    timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                try:
+                    result = await resp.json(content_type=None)
+                except Exception:
+                    result = {}
+                status = resp.status
+    except Exception as e:
+        print(f"⚠️ Santa: couldn't reach the website to collect a sign-up ({type(e).__name__})")
+        return (False, "I couldn't reach the website just now. Please try again in a minute.")
+    if status == 404:
+        return (False, "I couldn't find that code. It may have expired (they last 48 hours) or been used already. Fill in the form again to get a new one.")
+    if status != 200 or not isinstance(result, dict) or not result.get("success"):
+        print(f"⚠️ Santa: the website refused a sign-up lookup (HTTP {status})")
+        return (False, "Something went wrong collecting that sign-up. Please try again, or use the 🎁 button instead.")
+    return (True, result.get("entry") or {})
 
-    def __init__(self, entry_a, entry_b):
-        super().__init__(timeout=86400)  # 24 hours to respond
-        self.entry_a = entry_a
-        self.entry_b = entry_b
-        self.responses = {}  # user_id -> True/False
 
-    async def handle_response(self, interaction: discord.Interaction, accepted: bool):
-        self.responses[interaction.user.id] = accepted
+def _claim_allowed(user_id):
+    now = time.monotonic()
+    recent = [t for t in _claim_attempts.get(user_id, []) if now - t < CLAIM_WINDOW_SECONDS]
+    if len(recent) >= CLAIM_ATTEMPTS:
+        _claim_attempts[user_id] = recent
+        return False
+    recent.append(now)
+    _claim_attempts[user_id] = recent
+    return True
 
-        if not accepted:
-            await interaction.response.edit_message(
-                content="You declined this match. The other user will be notified.",
-                view=None
-            )
-            other_id = self.entry_b["user_id"] if interaction.user.id == self.entry_a["user_id"] else self.entry_a["user_id"]
+
+# ============================================================
+#  BACKGROUND LOOP: reminders, and keeping the website and counts fresh
+# ============================================================
+
+async def remind_givers(event, reason="reminder"):
+    """DMs everyone who hasn't marked their gift sent. Returns (delivered, failed). Never names anyone's giftee."""
+    noun = _kind(event)["noun"]
+    delivered = failed = 0
+    for g in givers_not_sent(event["id"]):
+        ok = await _dm(g["giver_id"], f"🎁 A friendly reminder from the Secret Santa **{event['name']}**: your {noun} is due by "
+                                      f"{_ts(event['exchange_by'], 'F')}. Press the 🎅 button on the announcement to see your giftee, "
+                                      f"and the 📦 button once it's sent!")
+        delivered += ok
+        failed += (not ok)
+    return (delivered, failed)
+
+
+def _clear_dirty(event_id):
+    with _db() as conn:
+        conn.execute("UPDATE st_events SET web_dirty = 0 WHERE id = ?", (event_id,))
+        conn.commit()
+
+
+async def santa_tick(now=None):
+    now = now or _now()
+    with _db() as conn:
+        waiting = [dict(r) for r in conn.execute("SELECT * FROM st_events WHERE status = 'scheduled' ORDER BY id").fetchall()]
+    for event in waiting:
+        try:
+            await _open_scheduled(event, now)
+        except Exception as e:
+            print(f"⚠️ Santa: couldn't open scheduled exchange {event['id']} ({type(e).__name__})")
+    for event in active_events():
+        try:
+            await _tick_one(event, now)
+        except Exception as e:
+            print(f"⚠️ Santa: problem with exchange {event['id']} ({type(e).__name__})")
+
+
+_open_warned = set()
+
+
+async def _open_scheduled(event, now):
+    """On the opening day: posts the announcement and starts taking sign-ups."""
+    if now < _parse(event["opens_at"]):
+        return
+    if now >= _parse(event["signups_close_at"]):
+        cancel_event(event["id"], now)
+        await _mod_log(f"⚠️ **{event['name']}** was supposed to open, but its sign-up deadline had already passed, so it was cancelled.")
+        return
+    with _txn() as conn:
+        cur = conn.execute("UPDATE st_events SET status = 'signups', web_dirty = 1 WHERE id = ? AND status = 'scheduled'", (event["id"],))
+        if cur.rowcount == 0:
+            return                                          # another pass already opened it
+    event = get_event(event["id"])
+    channel = await _get_channel(event["announce_channel_id"])
+    try:
+        message = await post_announcement(event, channel)
+    except Exception as e:
+        print(f"⚠️ Santa: couldn't post the opening announcement ({type(e).__name__})")
+        with _db() as conn:
+            conn.execute("UPDATE st_events SET status = 'scheduled' WHERE id = ?", (event["id"],))
+            conn.commit()
+        if event["id"] not in _open_warned:
+            _open_warned.add(event["id"])
+            await _mod_log(f"⚠️ I couldn't post the opening announcement for **{event['name']}** (check that I can send messages and embeds "
+                           f"in the channel). I'll keep trying every minute. You can also cancel it with `/santa cancel`.")
+        return
+    set_announcement(event["id"], channel.id, message.id)
+    await push_web(event["id"])
+    await _mod_log(f"🎄 **{event['name']}** is now open for sign-ups.")
+
+
+async def _tick_one(event, now):
+    # the moment sign-ups close: say so once, and let the mods know it's ready to draw
+    if event["status"] == "signups" and not event["closed_notice"] and now >= _parse(event["signups_close_at"]):
+        with _db() as conn:
+            cur = conn.execute("UPDATE st_events SET closed_notice = 1, web_dirty = 1 WHERE id = ? AND closed_notice = 0", (event["id"],))
+            conn.commit()
+            first = cur.rowcount > 0
+        if first:
+            event["web_dirty"] = 1
+            n = counts(event["id"])["signed_up"]
+            channel = await _get_channel(event["announce_channel_id"])
+            if channel is not None:
+                try:
+                    await channel.send(f"🔒 **Sign-ups for {event['name']} are now closed!** {n} {'person' if n == 1 else 'people'} signed up. "
+                                       f"The matches will be drawn soon.")
+                except Exception:
+                    pass
+            await _mod_log(f"🔒 Sign-ups for **{event['name']}** have closed with **{n}** signed up. "
+                           + ("When you're ready, run `/santa draw` and choose it." if n >= MIN_PLAYERS
+                              else f"That's fewer than the {MIN_PLAYERS} needed, so it can't be drawn yet."))
+    # reminders before the deadline: one a week out and one two days out. If the bot was offline and both
+    # are due at once, only a single reminder goes out.
+    if event["status"] == "drawn":
+        deadline = _parse(event["exchange_by"])
+        due = [column for days, column in ((REMINDER_DAYS[0], "reminded_7"), (REMINDER_DAYS[1], "reminded_2"))
+               if not event[column] and now >= deadline - timedelta(days=days)]
+        if due:
+            with _db() as conn:
+                for column in due:
+                    conn.execute(f"UPDATE st_events SET {column} = 1 WHERE id = ?", (event["id"],))
+                conn.commit()
+            if now < deadline:
+                await remind_givers(event)
+                waiting = len(givers_not_sent(event["id"]))
+                channel = await _get_channel(event["announce_channel_id"]) if waiting else None
+                if channel is not None:
+                    try:
+                        await channel.send(f"⏰ **{event['name']}**: {waiting} gift{'s' if waiting != 1 else ''} still to send, "
+                                           f"due {_ts(event['exchange_by'], 'R')}!")
+                    except Exception:
+                        pass
+    # keep the announcement's counts and the website current (at most every WEB_PUSH_MIN_SECONDS)
+    if event["web_dirty"]:
+        last = _last_web_push.get(event["id"])
+        if last is None or time.monotonic() - last >= WEB_PUSH_MIN_SECONDS:
+            await refresh_announcement(event["id"])
+            if web_enabled() and event["public_page"]:
+                if not await push_web(event["id"]):
+                    _last_web_push[event["id"]] = time.monotonic()      # the website is down: wait before trying again
+            else:
+                _clear_dirty(event["id"])
+
+
+async def santa_loop():
+    await _bot.wait_until_ready()
+    while not _bot.is_closed():
+        try:
+            await santa_tick()
+        except Exception as e:
+            print(f"⚠️ Santa: loop error ({type(e).__name__})")
+        await asyncio.sleep(LOOP_SECONDS)
+
+
+# ============================================================
+#  COMMANDS
+# ============================================================
+
+
+# ---------------------------------------------------------------- choosing which exchange a command is about
+
+def _kind_label(event):
+    return _kind(event)["label"]
+
+
+def _running_list(events):
+    return "\n".join(f"• **{e['name']}** ({_kind_label(e)})" for e in events)
+
+
+async def _pick_event(interaction, exchange, statuses=None, mine=False, none_text=None, include_scheduled=False):
+    """Works out which exchange a command means. Returns the event, or None after telling the person what to do.
+    exchange: what they chose in the pop-up list (an id) or typed (a name).
+    statuses: only exchanges in these stages count.  mine: with no choice made, use the one they're in."""
+    events = active_events(include_scheduled)
+    if exchange:
+        text = str(exchange).strip()
+        match = None
+        if not include_scheduled:
+            waiting = [e for e in active_events(True) if e["status"] == "scheduled"
+                       and (text == str(e["id"]) or text.lower() == e["name"].lower())]
+            if waiting:
+                await interaction.response.send_message(f"⚠️ **{waiting[0]['name']}** hasn't opened yet (it opens {_ts(waiting[0]['opens_at'], 'F')}).", ephemeral=True)
+                return None
+        if text.isdigit():
+            match = next((e for e in events if e["id"] == int(text)), None)
+        if match is None:
+            exact = [e for e in events if e["name"].lower() == text.lower()]
+            partial = [e for e in events if text.lower() in e["name"].lower()]
+            match = exact[0] if len(exact) == 1 else (partial[0] if len(partial) == 1 and not exact else None)
+        if match is None:
+            await interaction.response.send_message("⚠️ I couldn't tell which exchange you mean. Pick one from the list that pops up as you type.\n"
+                                                    + (_running_list(events) if events else ""), ephemeral=True)
+            return None
+        if statuses and match["status"] not in statuses:
+            await interaction.response.send_message(none_text or f"⚠️ That can't be done for **{match['name']}** right now (it's in the '{match['status']}' stage).", ephemeral=True)
+            return None
+        return match
+    if statuses:
+        events = [e for e in events if e["status"] in statuses]
+    if not events:
+        await interaction.response.send_message(none_text or "There's no Secret Santa running right now.", ephemeral=True)
+        return None
+    if len(events) == 1:
+        return events[0]
+    if mine:
+        joined = [e for e in events if get_entry(e["id"], interaction.user.id)]
+        if len(joined) == 1:
+            return joined[0]
+        if not joined:
+            await interaction.response.send_message("You're not signed up for any of the running exchanges:\n" + _running_list(events), ephemeral=True)
+            return None
+        events = joined
+    await interaction.response.send_message("⚠️ More than one exchange fits, so please choose one in the **exchange** box:\n" + _running_list(events), ephemeral=True)
+    return None
+
+
+async def _exchange_autocomplete(interaction: discord.Interaction, current: str):
+    events = active_events(True)
+    joined = {e["id"] for e in events if get_entry(e["id"], interaction.user.id)}
+    events.sort(key=lambda e: (e["id"] not in joined, e["id"]))
+    needle = (current or "").lower()
+    out = []
+    for e in events:
+        label = f"{e['name']} ({_kind_label(e)})" + (" ✓" if e["id"] in joined else "") + (" (not open yet)" if e["status"] == "scheduled" else "")
+        if needle in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=str(e["id"])))
+    return out[:25]
+
+
+EXCHANGE_HELP = "Which exchange (only needed when more than one is running)"
+
+
+santa_group = app_commands.Group(name="santa", description="Secret Santa gift and art exchanges", guild_only=True)
+
+
+class _ConfirmView(discord.ui.View):
+    """A Confirm / Cancel step for actions that can't be undone."""
+
+    def __init__(self, user_id, action):
+        super().__init__(timeout=180)
+        self.user_id, self.action, self.used = user_id, action, False
+
+    @discord.ui.button(label="Yes, do it", style=discord.ButtonStyle.danger)
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id or not _is_mod(interaction.user):
+            await interaction.response.send_message("⚠️ This belongs to the mod who opened it.", ephemeral=True)
+            return
+        if self.used:
+            await interaction.response.send_message("Already handled.", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(content="⏳ Working…", view=None)
+        await interaction.edit_original_response(content=await self.action())
+
+    @discord.ui.button(label="Never mind", style=discord.ButtonStyle.secondary)
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("⚠️ This belongs to the mod who opened it.", ephemeral=True)
+            return
+        self.used = True
+        self.stop()
+        await interaction.response.edit_message(content="Okay, nothing changed.", view=None)
+
+
+def _kind_choices():
+    return [app_commands.Choice(name=v["label"], value=k) for k, v in KINDS.items()]
+
+
+@santa_group.command(name="start", description="[Mod] Start a Secret Santa exchange (you can run several at once)")
+@app_commands.describe(
+    name="What it's called, like 'Winter Secret Santa 2026'",
+    kind="Gift, NP, NC or art exchange (changes what people are asked). You can run several at once",
+    signups_until="When sign-ups close (Pacific time): 2026-12-01 closes 11:59 PM, or 2026-12-01 6:00 PM for an exact time",
+    exchange_by="Day gifts or art are due, as YYYY-MM-DD (11:59 PM Pacific)",
+    budget="Guidelines, like 'Up to 1 million NP in items' or 'one piece of art, SFW'",
+    rules="Any extra rules",
+    announce_channel="Where to post (default: this channel)",
+    public_page="Also show an event page on the website? (default yes)",
+    opens_on="Open sign-ups later (Pacific time): 2026-11-20 opens at 9:00 AM, or 2026-11-20 6:00 PM. Blank = open now",
+    ping="A role to @mention when sign-ups open",
+)
+@app_commands.choices(kind=_kind_choices())
+async def santa_start(interaction: discord.Interaction, name: app_commands.Range[str, 1, 80], kind: app_commands.Choice[str],
+                      signups_until: str, exchange_by: str, budget: Optional[app_commands.Range[str, 0, BUDGET_MAX]] = None,
+                      rules: Optional[app_commands.Range[str, 0, RULES_MAX]] = None,
+                      announce_channel: Optional[discord.TextChannel] = None, public_page: bool = True,
+                      opens_on: Optional[str] = None, ping: Optional[discord.Role] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    try:
+        close_at, due_at = parse_pacific(signups_until), _end_of_pacific_day(exchange_by)
+        open_at = parse_pacific(opens_on, (9, 0, 0)) if opens_on and opens_on.strip() else None
+    except ValueError:
+        await interaction.response.send_message("⚠️ Dates should look like `2026-12-01`, or with a time: `2026-12-01 6:00 PM` (Pacific time).", ephemeral=True)
+        return
+    now = _now()
+    if open_at is not None and open_at >= close_at - timedelta(hours=1):
+        await interaction.response.send_message("⚠️ Sign-ups need to open before they close (with at least an hour to spare).", ephemeral=True)
+        return
+    if close_at <= now + timedelta(hours=1):
+        await interaction.response.send_message("⚠️ The sign-up deadline has to be in the future.", ephemeral=True)
+        return
+    if due_at <= close_at:
+        await interaction.response.send_message("⚠️ Gifts must be due after sign-ups close.", ephemeral=True)
+        return
+    channel = announce_channel or interaction.channel
+    ok, event_id = create_event(name.strip(), kind.value, interaction.user.id, getattr(channel, "id", None), close_at, due_at,
+                                (budget or "").strip() or None, (rules or "").strip() or None, public_page, now,
+                                opens_at=open_at, ping_role_id=ping.id if ping else None)
+    if not ok:
+        await interaction.response.send_message(f"⚠️ {event_id}", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    event = get_event(event_id)
+    if event["status"] == "scheduled":
+        await interaction.followup.send(
+            f"🗓️ **{name.strip()}** is scheduled. I'll post the announcement in {getattr(channel, 'mention', 'that channel')} on {_ts(event['opens_at'], 'F')} "
+            f"({_ts(event['opens_at'], 'R')}), and sign-ups will close {_ts(_iso(close_at), 'F')}." + (f" I'll mention {ping.mention}." if ping else "")
+            + "\nChanged your mind? `/santa cancel` works until it opens.", ephemeral=True)
+        return
+    try:
+        message = await post_announcement(event, channel)
+    except Exception as e:
+        print(f"⚠️ Santa: couldn't post the announcement ({type(e).__name__})")
+        cancel_event(event_id, now)
+        await interaction.followup.send("⚠️ I couldn't post in that channel (check that I can send messages and embeds there). Nothing was started.", ephemeral=True)
+        return
+    set_announcement(event_id, channel.id, message.id)
+    await push_web(event_id)
+    link = web_link(event)
+    await interaction.followup.send(
+        f"✅ **{name.strip()}** is open for sign-ups until {_ts(_iso(close_at))}." + (f"\n🌐 Event page: {link}" if link else "")
+        + f"\nWhen you're ready, run `/santa draw` and choose **{name.strip()}**.", ephemeral=True)
+
+
+@santa_group.command(name="open", description="[Mod] Open a waiting exchange right now instead of on its scheduled day")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_open(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, statuses=("scheduled",), include_scheduled=True,
+                              none_text="⚠️ There's no exchange waiting to open. (Use `/santa start` to make one.)")
+    if not event:
+        return
+    await interaction.response.defer(ephemeral=True)
+    with _db() as conn:
+        conn.execute("UPDATE st_events SET opens_at = ? WHERE id = ? AND status = 'scheduled'", (_iso(_now()), event["id"]))
+        conn.commit()
+    await _open_scheduled(get_event(event["id"]), _now() + timedelta(seconds=1))
+    now_state = get_event(event["id"])
+    if now_state["status"] == "signups":
+        await interaction.followup.send(f"🎄 **{event['name']}** is open! The announcement is posted. Sign-ups close {_ts(event['signups_close_at'], 'F')}.", ephemeral=True)
+    elif now_state["status"] == "cancelled":
+        await interaction.followup.send("⚠️ Its sign-up deadline had already passed, so it was cancelled. Use `/santa start` to make a new one.", ephemeral=True)
+    else:
+        await interaction.followup.send("⚠️ I couldn't post in that channel (check that I can send messages and embeds there). It's still waiting; I'll keep trying every minute.", ephemeral=True)
+
+
+@santa_group.command(name="reschedule", description="[Mod] Change an exchange's dates (opening, sign-up deadline, or due date)")
+@app_commands.describe(
+    exchange=EXCHANGE_HELP,
+    opens_on="New opening time (Pacific), only while it's still waiting: 2026-11-25 or 2026-11-25 6:00 PM",
+    signups_until="New sign-up deadline (Pacific): 2026-12-01 closes 11:59 PM, or 2026-12-01 6:00 PM. Can reopen sign-ups that just closed",
+    exchange_by="New due date for the gifts or art (11:59 PM Pacific): 2026-12-20",
+)
+async def santa_reschedule(interaction: discord.Interaction, exchange: Optional[str] = None, opens_on: Optional[str] = None,
+                           signups_until: Optional[str] = None, exchange_by: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    if not any(x and x.strip() for x in (opens_on, signups_until, exchange_by)):
+        await interaction.response.send_message("⚠️ Tell me what to change: `opens_on`, `signups_until` and/or `exchange_by`.", ephemeral=True)
+        return
+    try:
+        new_open = parse_pacific(opens_on, (9, 0, 0)) if opens_on and opens_on.strip() else None
+        new_close = parse_pacific(signups_until) if signups_until and signups_until.strip() else None
+        new_due = _end_of_pacific_day(exchange_by) if exchange_by and exchange_by.strip() else None
+    except ValueError:
+        await interaction.response.send_message("⚠️ Dates should look like `2026-12-01`, or with a time: `2026-12-01 6:00 PM` (Pacific time). "
+                                                "The due date takes a day only.", ephemeral=True)
+        return
+    event = await _pick_event(interaction, exchange, statuses=("scheduled", "signups", "drawn"), include_scheduled=True,
+                              none_text="⚠️ There's no exchange whose dates can be changed.")
+    if not event:
+        return
+    now = _now()
+    ok, result = reschedule_event(event["id"], now, new_open, new_close, new_due)
+    if not ok:
+        await interaction.response.send_message(f"⚠️ {result}", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    changed = []
+    if new_open:
+        changed.append(f"opens {_ts(result['opens_at'], 'F')}")
+    if new_close:
+        changed.append(f"sign-ups close {_ts(result['signups_close_at'], 'F')}")
+    if new_due:
+        changed.append(f"due {_ts(result['exchange_by'], 'F')}")
+    summary = ", ".join(changed)
+    if result["status"] == "scheduled":
+        if new_open and _parse(result["opens_at"]) <= now + timedelta(minutes=2):
+            await _open_scheduled(result, now + timedelta(seconds=1))
+            summary += " (that's right away, so it opened now)"
+        await interaction.followup.send(f"📅 **{event['name']}**: {summary}.", ephemeral=True)
+        return
+    # already announced: update the post and tell the channel
+    await refresh_announcement(event["id"])
+    channel = await _get_channel(event["announce_channel_id"])
+    if channel is not None and (new_close or new_due):
+        parts = []
+        if new_close:
+            parts.append(f"sign-ups now close {_ts(result['signups_close_at'], 'F')} ({_ts(result['signups_close_at'], 'R')})")
+        if new_due:
+            parts.append(f"{_kind(result)['noun']}s are now due by {_ts(result['exchange_by'], 'F')}")
+        try:
+            await channel.send(f"📅 **Date change for {event['name']}:** " + " and ".join(parts) + ".")
+        except Exception:
+            pass
+    await push_web(event["id"])
+    await _mod_log(f"📅 {interaction.user.display_name} changed the dates for **{event['name']}**: {summary}.")
+    await interaction.followup.send(f"📅 **{event['name']}**: {summary}. The announcement was updated and the channel was told.", ephemeral=True)
+
+
+@santa_group.command(name="join", description="Sign up (or edit your entry). Have a code from the website? Add it here")
+@app_commands.describe(code="The code from the website sign-up form, like K7M2-9QPX", exchange=EXCHANGE_HELP)
+async def santa_join(interaction: discord.Interaction, code: Optional[str] = None, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction):
+        return
+    if not code:
+        event = await _pick_event(interaction, exchange)
+        if event:
+            await open_entry_form(interaction, event)
+        return
+    if getattr(interaction.user, "bot", False):
+        await interaction.response.send_message("⚠️ Bots can't take part.", ephemeral=True)
+        return
+    if not _claim_allowed(interaction.user.id):
+        await interaction.response.send_message("⚠️ That's a lot of tries. Please wait a few minutes and check the code.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok, result = await claim_web_signup(code)
+    if not ok:
+        await interaction.followup.send(f"⚠️ {result}", ephemeral=True)
+        return
+    # the code itself says which exchange it's for
+    event = get_event(result.get("event_id")) if isinstance(result.get("event_id"), int) else None
+    if event is None or event["status"] not in ("signups", "drawn", "revealed"):
+        await interaction.followup.send("⚠️ That code was for an exchange that isn't running any more.", ephemeral=True)
+        return
+    existing = get_entry(event["id"], interaction.user.id)
+    if not existing and (event["status"] != "signups" or _now() >= _parse(event["signups_close_at"])):
+        await interaction.followup.send(f"⚠️ Sign-ups for **{event['name']}** have closed.", ephemeral=True)
+        return
+    valid, cleaned = validate_entry(result.get("neopets_name"), result.get("wants"), result.get("links"), result.get("avoid"))
+    if not valid:
+        await interaction.followup.send(f"⚠️ {cleaned} Please press the 🎁 button on the **{event['name']}** announcement instead.", ephemeral=True)
+        return
+    saved, outcome = upsert_entry(event["id"], interaction.user.id, interaction.user.display_name, cleaned, "web", _now())
+    await interaction.followup.send((f"**{event['name']}**\n" + _entry_saved_text(outcome)) if saved else f"⚠️ {outcome}", ephemeral=True)
+
+
+@santa_group.command(name="list", description="See the exchanges that are running and which ones you're in")
+async def santa_list(interaction: discord.Interaction):
+    if await _deny_wrong_guild(interaction):
+        return
+    events = active_events(True)
+    if not events:
+        await interaction.response.send_message("There's no Secret Santa running right now.", ephemeral=True)
+        return
+    lines = []
+    for e in events:
+        mine = get_entry(e["id"], interaction.user.id)
+        stage = {"signups": "sign-ups open", "drawn": "matches drawn", "revealed": "revealed", "scheduled": "coming soon"}.get(e["status"], e["status"])
+        line = f"{'✅' if mine else '▫️'} **{e['name']}** ({_kind_label(e)}): {stage}"
+        if e["status"] == "scheduled":
+            line += f", sign-ups open {_ts(e['opens_at'], 'R')}"
+        elif e["status"] == "signups" and _now() >= _parse(e["signups_close_at"]):
+            line += ", sign-ups closed"
+        elif e["status"] == "signups":
+            line += f", sign-ups close {_ts(e['signups_close_at'], 'R')}"
+        elif e["status"] == "drawn":
+            line += f", due {_ts(e['exchange_by'], 'R')}"
+        lines.append(line)
+    lines.append("\n✅ = you're in. You can join as many as you like!")
+    await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
+
+
+@santa_group.command(name="leave", description="Withdraw from the exchange (before the matches are drawn)")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_leave(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=True)
+    if not event:
+        return
+    ok, why = leave_event(event["id"], interaction.user.id)
+    await interaction.response.send_message("👋 You've been removed. You can sign up again until sign-ups close." if ok else f"⚠️ {why}", ephemeral=True)
+
+
+@santa_group.command(name="me", description="See your entry and where things stand")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_me(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=True)
+    if not event:
+        return
+    mine = get_entry(event["id"], interaction.user.id)
+    if not mine:
+        await interaction.response.send_message("You're not signed up. Press the 🎁 button on the announcement or use `/santa join`.", ephemeral=True)
+        return
+    lines = [f"🎅 **{event['name']}**", f"Your Neopets username: **{mine['neopets_name']}**", f"**You asked for:** {mine['wants'] or '—'}"]
+    if mine["links"]:
+        lines.append(f"**Links:** {mine['links']}")
+    if mine["avoid"]:
+        lines.append(f"**Please avoid:** {mine['avoid']}")
+    giver_row = match_row_as_giver(event["id"], interaction.user.id)
+    if event["status"] == "signups":
+        lines.append("The matches haven't been drawn yet.")
+    elif giver_row:
+        lines.append("📦 You've sent your gift." if giver_row["sent_at"] else "You haven't marked your gift as sent yet.")
+        received = match_row_as_giftee(event["id"], interaction.user.id)
+        lines.append("💌 You've marked your gift as received." if received and received["received_at"] else "Your own gift hasn't been marked as received yet.")
+    await interaction.response.send_message("\n".join(lines)[:1990], ephemeral=True)
+
+
+@santa_group.command(name="match", description="See who you're the Secret Santa for")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_match(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=True)
+    if not event:
+        return
+    await show_match(interaction, event)
+
+
+@santa_group.command(name="sent", description="Mark your gift as sent")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+@app_commands.describe(undo="Set this to un-mark it")
+async def santa_sent(interaction: discord.Interaction, undo: bool = False, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=True)
+    if not event:
+        return
+    await do_mark_sent(interaction, event, undo)
+
+
+@santa_group.command(name="received", description="Say your gift arrived, with an optional thank-you")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+@app_commands.describe(thanks="A thank-you note for your Santa (shown at the reveal)")
+async def santa_received(interaction: discord.Interaction, thanks: Optional[app_commands.Range[str, 0, THANKS_MAX]] = None, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=True)
+    if not event:
+        return
+    ok, result = mark_received(event["id"], interaction.user.id, _now(), thanks)
+    await interaction.response.send_message(("💌 Marked as received. Thank you!" if result == "marked" else "✅ Already marked. Your note was updated.")
+                                            if ok else f"⚠️ {result}", ephemeral=True)
+
+
+@santa_group.command(name="block", description="[Mod] Make sure two members are never matched with each other")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+@app_commands.describe(member_a="First member", member_b="Second member")
+async def santa_block(interaction: discord.Interaction, member_a: discord.Member, member_b: discord.Member, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=False, include_scheduled=True)
+    if not event:
+        return
+    ok, why = add_block(event["id"], member_a.id, member_b.id)
+    await interaction.response.send_message(
+        f"✅ In **{event['name']}**, {member_a.display_name} and {member_b.display_name} won't be matched with each other (in either direction)."
+        + (" This works even though it hasn't opened yet, and the block will still be there when it does." if event["status"] == "scheduled" else "") if ok else f"⚠️ {why}",
+        ephemeral=True)
+
+
+@santa_group.command(name="unblock", description="[Mod] Remove a blocked pair")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_unblock(interaction: discord.Interaction, member_a: discord.Member, member_b: discord.Member, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=False, include_scheduled=True)
+    if not event:
+        return
+    ok, why = remove_block(event["id"], member_a.id, member_b.id)
+    await interaction.response.send_message("✅ Unblocked." if ok else f"⚠️ {why}", ephemeral=True)
+
+
+@santa_group.command(name="draw", description="[Mod] Draw the matches (everyone gets someone; nobody gets themselves)")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_draw(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, statuses=("signups",), none_text="⚠️ There's no exchange waiting to be drawn.")
+    if not event:
+        return
+    n = len(entries_for(event["id"]))
+    blocks = len(blocked_pairs(event["id"]))
+    if n < MIN_PLAYERS:
+        await interaction.response.send_message(f"⚠️ Only {n} signed up. You need at least {MIN_PLAYERS}.", ephemeral=True)
+        return
+    early = _now() < _parse(event["signups_close_at"])
+
+    async def do_draw():
+        ok, result = draw_event(event["id"], _now())
+        if not ok:
+            return f"⚠️ {result}"
+        await refresh_announcement(event["id"])
+        channel = await _get_channel(event["announce_channel_id"])
+        if channel is not None:
             try:
-                other_user = await bot.fetch_user(other_id)
-                await other_user.send("The other person declined the art trade match. You're still in the pool!")
+                await channel.send(f"🎅 **The matches for {event['name']} are out!** Press **🎅 My giftee** on the announcement to see who you're giving to. "
+                                   f"Remember: it's a secret! 🤫")
             except Exception:
                 pass
-            return
-
-        await interaction.response.edit_message(
-            content="✅ You accepted! Waiting to see if the other person accepts too...",
-            view=None
-        )
-
-        a_id = self.entry_a["user_id"]
-        b_id = self.entry_b["user_id"]
-        if self.responses.get(a_id) and self.responses.get(b_id):
-            await finalize_match(self.entry_a, self.entry_b)
-
-    @discord.ui.button(label="Accept Match", style=discord.ButtonStyle.success, emoji="✅")
-    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_response(interaction, True)
-
-    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger, emoji="❌")
-    async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.handle_response(interaction, False)
-
-
-class SuggestionModal(discord.ui.Modal, title="Submit a Suggestion"):
-    suggestion_text = discord.ui.TextInput(
-        label="What's your suggestion?",
-        style=discord.TextStyle.paragraph,
-        placeholder="Share an idea for the guild...",
-        max_length=1000,
-        required=True,
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        channel = discord.utils.get(interaction.guild.text_channels, name=SUGGESTIONS_CHANNEL)
-        if not channel:
-            await interaction.response.send_message(
-                f"⚠️ Couldn't find the #{SUGGESTIONS_CHANNEL} channel — let a mod know.",
-                ephemeral=True
-            )
-            return
-
-        embed = discord.Embed(description=self.suggestion_text.value, color=0xD68A4E)
-        embed.set_author(
-            name=f"Suggestion from {interaction.user.display_name}",
-            icon_url=interaction.user.display_avatar.url
-        )
-
-        posted = await channel.send(content=interaction.user.mention, embed=embed)
-        await posted.add_reaction("👍")
-        await posted.add_reaction("👎")
-
-        await interaction.response.send_message(
-            f"✅ Your suggestion has been posted in #{SUGGESTIONS_CHANNEL}!",
-            ephemeral=True
-        )
-
-
-class StayOrLeaveView(discord.ui.View):
-    """Asks a matched user whether to stay in the pool or be removed."""
-
-    def __init__(self, user_id):
-        super().__init__(timeout=86400)
-        self.user_id = user_id
-
-    @discord.ui.button(label="Remove me from the pool", style=discord.ButtonStyle.secondary)
-    async def remove(self, interaction: discord.Interaction, button: discord.ui.Button):
-        art_trade_pool.pop(self.user_id, None)
-        db_remove_entry(self.user_id)
-        await interaction.response.edit_message(content="You've been removed from the art trade pool. Good luck with your trade! 🎨", view=None)
-
-    @discord.ui.button(label="Keep me in the pool", style=discord.ButtonStyle.primary)
-    async def keep(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="You'll stay in the pool in case another good match comes along! 🎨", view=None)
-
-
-async def finalize_match(entry_a, entry_b):
-    """Called when both users have accepted the match."""
-    try:
-        user_a = await bot.fetch_user(entry_a["user_id"])
-        user_b = await bot.fetch_user(entry_b["user_id"])
-
-        await user_a.send(
-            f"🎉 It's a match! You and **{user_b.display_name}** both accepted the art trade!\n"
-            f"Their character: **{entry_b['character']}**\n\n"
-            f"Reach out to them to get started! Would you like to stay in the pool for future matches?",
-            view=StayOrLeaveView(entry_a["user_id"])
-        )
-        await user_b.send(
-            f"🎉 It's a match! You and **{user_a.display_name}** both accepted the art trade!\n"
-            f"Their character: **{entry_a['character']}**\n\n"
-            f"Reach out to them to get started! Would you like to stay in the pool for future matches?",
-            view=StayOrLeaveView(entry_b["user_id"])
-        )
-        print(f"🎉 Art trade match finalized: {user_a.display_name} <-> {user_b.display_name}")
-    except Exception as e:
-        print(f"⚠️ Could not finalize match: {e}")
-
-
-async def process_art_trade_submission(interaction: discord.Interaction, sizes, styles, mediums, character):
-    """Shared logic for finalizing an art trade submission once all selections are made."""
-    new_entry = {
-        "user_id": interaction.user.id,
-        "size": sizes,
-        "style": styles,
-        "medium": mediums,
-        "character": character,
-    }
-
-    found_match = None
-    for existing_entry in art_trade_pool.values():
-        if entries_match(new_entry, existing_entry):
-            found_match = existing_entry
-            break
-
-    art_trade_pool[interaction.user.id] = new_entry
-    db_add_entry(new_entry)  # persist to SQLite
-
-    print(f"🎨 {interaction.user.display_name} submitted art trade request — "
-          f"Size: {format_list(sizes)}, Style: {format_list(styles)}, Medium: {format_list(mediums)}, "
-          f"Character: {character}")
-
-    if found_match:
-        print(f"🎨 Potential match found with user {found_match['user_id']}!")
-    else:
-        print(f"🎨 No match found yet for {interaction.user.display_name} — added to pool ({len(art_trade_pool)} total in pool)")
-
-    await interaction.response.edit_message(
-        content=(
-            f"✅ You've been added to the art trade pool!\n"
-            f"**Size:** {format_list(sizes)}\n"
-            f"**Style:** {format_list(styles)}\n"
-            f"**Medium:** {format_list(mediums)}\n"
-            f"**Character:** {character}\n\n"
-            f"💡 Tip: selecting *all* options for a field means you don't mind what your partner offers there.\n"
-            f"I'll DM you if a match is found. Use `/cancel` anytime to withdraw."
-        ),
-        view=None
-    )
-
-    if found_match:
-        try:
-            user_a = await bot.fetch_user(new_entry["user_id"])
-            user_b = await bot.fetch_user(found_match["user_id"])
-
-            await user_a.send(
-                f"🎨 A potential art trade match was found!\n"
-                f"**{user_b.display_name}** offers: {format_list(found_match['size'])} / "
-                f"{format_list(found_match['style'])} / {format_list(found_match['medium'])}\n"
-                f"Character: **{found_match['character']}**\n\n"
-                f"Do you want to accept this match?",
-                view=MatchConfirmView(new_entry, found_match)
-            )
-            await user_b.send(
-                f"🎨 A potential art trade match was found!\n"
-                f"**{user_a.display_name}** offers: {format_list(new_entry['size'])} / "
-                f"{format_list(new_entry['style'])} / {format_list(new_entry['medium'])}\n"
-                f"Character: **{new_entry['character']}**\n\n"
-                f"Do you want to accept this match?",
-                view=MatchConfirmView(new_entry, found_match)
-            )
-            print(f"🎨 Potential match found: {user_a.display_name} <-> {user_b.display_name}")
-        except Exception as e:
-            print(f"⚠️ Could not send match DMs: {e}")
-
-
-class ArtTradeSelectView(discord.ui.View):
-    """Multi-select dropdowns for Size, Style, and Medium, plus a Submit button."""
-
-    def __init__(self, character):
-        super().__init__(timeout=300)  # 5 minutes to finish selecting
-        self.character = character
-        self.selected_sizes = []
-        self.selected_styles = []
-        self.selected_mediums = []
-
-        self.size_select = discord.ui.Select(
-            placeholder="🖼️ Select size(s) you're offering/looking for...",
-            min_values=1,
-            max_values=len(SIZE_CHOICES),
-            options=[discord.SelectOption(label=s) for s in SIZE_CHOICES],
-        )
-        self.size_select.callback = self.on_size_select
-        self.add_item(self.size_select)
-
-        self.style_select = discord.ui.Select(
-            placeholder="🎨 Select style(s) you're offering/looking for...",
-            min_values=1,
-            max_values=len(STYLE_CHOICES),
-            options=[discord.SelectOption(label=s) for s in STYLE_CHOICES],
-        )
-        self.style_select.callback = self.on_style_select
-        self.add_item(self.style_select)
-
-        self.medium_select = discord.ui.Select(
-            placeholder="✏️ Select medium(s) you're offering/looking for...",
-            min_values=1,
-            max_values=len(MEDIUM_CHOICES),
-            options=[discord.SelectOption(label=s) for s in MEDIUM_CHOICES],
-        )
-        self.medium_select.callback = self.on_medium_select
-        self.add_item(self.medium_select)
-
-    async def on_size_select(self, interaction: discord.Interaction):
-        self.selected_sizes = self.size_select.values
-        await interaction.response.defer()
-
-    async def on_style_select(self, interaction: discord.Interaction):
-        self.selected_styles = self.style_select.values
-        await interaction.response.defer()
-
-    async def on_medium_select(self, interaction: discord.Interaction):
-        self.selected_mediums = self.medium_select.values
-        await interaction.response.defer()
-
-    @discord.ui.button(label="Submit Art Trade Request", style=discord.ButtonStyle.success, emoji="🎨", row=3)
-    async def submit(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not self.selected_sizes or not self.selected_styles or not self.selected_mediums:
-            await interaction.response.send_message(
-                "⚠️ Please select at least one option in each dropdown (Size, Style, Medium) before submitting!",
-                ephemeral=True
-            )
-            return
-
-        await process_art_trade_submission(
-            interaction, self.selected_sizes, self.selected_styles, self.selected_mediums, self.character
-        )
-
-
-@bot.tree.command(name="arttrade", description="Submit a request to find an art trade partner")
-@app_commands.describe(character="The character you want drawn")
-async def arttrade(interaction: discord.Interaction, character: str):
-    await interaction.response.send_message(
-        "🎨 Pick your Size, Style, and Medium below — you can select **multiple** options in each! "
-        "Then hit Submit.\n\n"
-        "💡 Tip: selecting *all* options for a field means you're flexible and don't mind what your partner offers there.",
-        view=ArtTradeSelectView(character),
-        ephemeral=True
-    )
-
-
-@bot.tree.command(name="cancel", description="Withdraw your art trade request from the pool")
-async def cancel(interaction: discord.Interaction):
-    if interaction.user.id in art_trade_pool:
-        del art_trade_pool[interaction.user.id]
-        db_remove_entry(interaction.user.id)
-        await interaction.response.send_message("You've been removed from the art trade pool.", ephemeral=True)
-    else:
-        await interaction.response.send_message("You don't have an active art trade request.", ephemeral=True)
-
-
-# ============================================================
-#  COMMISSIONS
-# ============================================================
-
-@bot.tree.command(name="listcomm", description="List your open commissions")
-@app_commands.describe(
-    where="Where to find/order your commissions (link or description)",
-    slots="Number of open slots (leave blank for unlimited/until you close it)",
-)
-async def listcomm(interaction: discord.Interaction, where: str, slots: int = None):
-    db_set_commission(interaction.user.id, slots, where)
-    slots_text = f"{slots} slot(s)" if slots is not None else "unlimited slots"
-    await interaction.response.send_message(
-        f"✅ Your commissions are now listed as open with {slots_text}!\nUse `/updatecomm` to change your slot count, or `/closecomm` to remove your listing.",
-        ephemeral=True
-    )
-    print(f"🖌️ {interaction.user.display_name} listed commissions ({slots_text})")
-
-
-@bot.tree.command(name="updatecomm", description="Update your remaining commission slots")
-@app_commands.describe(slots="Your new number of open slots")
-async def updatecomm(interaction: discord.Interaction, slots: int):
-    existing = db_get_commission(interaction.user.id)
-    if not existing:
-        await interaction.response.send_message(
-            "You don't have an active commission listing. Use `/listcomm` first!",
-            ephemeral=True
-        )
-        return
-
-    db_set_commission(interaction.user.id, slots, existing["where"])
-    await interaction.response.send_message(f"✅ Updated! You now have {slots} slot(s) open.", ephemeral=True)
-    print(f"🖌️ {interaction.user.display_name} updated commission slots to {slots}")
-
-
-@bot.tree.command(name="closecomm", description="Remove your commission listing")
-async def closecomm(interaction: discord.Interaction):
-    existing = db_get_commission(interaction.user.id)
-    if not existing:
-        await interaction.response.send_message("You don't have an active commission listing.", ephemeral=True)
-        return
-
-    db_remove_commission(interaction.user.id)
-    await interaction.response.send_message("Your commission listing has been removed.", ephemeral=True)
-    print(f"🖌️ {interaction.user.display_name} closed their commission listing")
-
-
-@bot.tree.command(name="opencomms", description="Get a DM with everyone currently offering open commissions")
-async def opencomms(interaction: discord.Interaction):
-    all_comms = db_load_all_commissions()
-
-    if not all_comms:
-        await interaction.response.send_message("No one currently has open commissions listed.", ephemeral=True)
-        return
-
-    lines = []
-    for comm in all_comms:
-        try:
-            user = await bot.fetch_user(comm["user_id"])
-            name = user.display_name
-        except Exception:
-            name = f"User {comm['user_id']}"
-
-        slots_text = f"{comm['slots']} slot(s)" if comm["slots"] is not None else "Unlimited slots"
-        lines.append(f"**{name}** — {slots_text}\n{comm['where']}")
-
-    message_text = "🖌️ **Currently Open Commissions**\n\n" + "\n\n".join(lines)
-
-    try:
-        await interaction.user.send(message_text)
-        await interaction.response.send_message("📬 Sent you a DM with the current list!", ephemeral=True)
-    except Exception:
-        await interaction.response.send_message(
-            "⚠️ I couldn't DM you — please check your privacy settings allow DMs from server members.",
-            ephemeral=True
-        )
-
-
-# ============================================================
-#  FAIR TRADE CALCULATOR
-# ============================================================
-
-def parse_items(text):
-    """
-    Parse item lines into a list of (name, total_value, is_priority, display) tuples.
-    Accepts two formats:
-      - 'Item Name:Value'        e.g. 'Liquid Glass Filter:4'
-      - 'Item Name - Value Caps' e.g. 'Liquid Glass Filter - 4 Caps'
-    Both formats support:
-      - Ranges, e.g. 'Item:1-2' or 'Item - 1-2 Caps' — the midpoint is used for math,
-        the original range is kept for display.
-      - A '*' prefix on the name to mark it as a must-keep priority item.
-      - A quantity multiplier, e.g. 'Item - 1.5 Caps (x15)' or 'Item - 1.5 Caps x15'
-        — multiplies the per-unit value by the quantity for the total.
-    """
-    items = []
-    errors = []
-    if not text or not text.strip():
-        return items, errors
-
-    for chunk in re.split(r"[,\n]+", text):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-
-        name = None
-        value_str = None
-
-        if ":" in chunk:
-            name, _, value_str = chunk.rpartition(":")
-        elif " - " in chunk:
-            name, _, value_str = chunk.rpartition(" - ")
-        else:
-            errors.append(chunk)
-            continue
-
-        name = name.strip()
-        value_str = value_str.strip()
-
-        is_priority = name.startswith("*")
-        if is_priority:
-            name = name[1:].strip()
-
-        # Pull out the numeric value or range, ignoring trailing words like "Caps"/"Cap"
-        match = re.search(r"(\d+(?:\.\d+)?)\s*(?:-\s*(\d+(?:\.\d+)?))?", value_str)
-        if not name or not match:
-            errors.append(chunk)
-            continue
-
-        low = float(match.group(1))
-        high = float(match.group(2)) if match.group(2) else low
-        if low > high:
-            low, high = high, low
-        unit_value = (low + high) / 2
-
-        # Look for a quantity multiplier AFTER the value, e.g. "(x15)" or "x15"
-        quantity = 1
-        qty_match = re.search(r"x\s*(\d+)", value_str[match.end():], re.IGNORECASE)
-        if qty_match:
-            quantity = int(qty_match.group(1))
-
-        total_value = unit_value * quantity
-
-        unit_display = f"{low:g}" if low == high else f"{low:g}-{high:g}"
-        if quantity > 1:
-            display = f"{unit_display} (x{quantity}) = {total_value:g}"
-        else:
-            display = unit_display
-
-        items.append((name, total_value, is_priority, display))
-
-    return items, errors
-
-
-def build_value_clusters(items):
-    """Groups items sharing the same value together, e.g. two items both worth 2
-    become one cluster so they can be suggested as 'Item C or Item D' instead
-    of as separate, redundant combo options."""
-    clusters = {}
-    order = []
-    for it in items:
-        key = round(it[1], 4)
-        if key not in clusters:
-            clusters[key] = []
-            order.append(key)
-        clusters[key].append(it)
-    return [(key, clusters[key]) for key in order]
-
-
-def format_cluster_group(cluster):
-    value, item_list = cluster
-    return " or ".join(it[0] for it in item_list)
-
-
-def format_combo_side(chosen_clusters):
-    return " + ".join(format_cluster_group(c) for c in chosen_clusters)
-
-
-def find_matching_combos(side_a_items, side_b_items, max_subset_size=3, max_results=4, tolerance_ratio=0.15):
-    """
-    Finds smaller groupings of items from each side whose combined values are
-    close to each other — e.g. 'your Item A + Item B ≈ their Item G' — rather
-    than only looking at the overall trade balance.
-    Capped in scope to keep this fast even with a handful of items per side.
-    """
-    from itertools import combinations
-
-    clusters_a = build_value_clusters(side_a_items)
-    clusters_b = build_value_clusters(side_b_items)
-
-    # Safety cap — reduce subset depth if there are a lot of distinct clusters
-    if len(clusters_a) > 10 or len(clusters_b) > 10:
-        max_subset_size = min(max_subset_size, 2)
-
-    def gen_subsets(clusters, max_size):
-        n = len(clusters)
-        subsets = []
-        for size in range(1, min(max_size, n) + 1):
-            for combo_idx in combinations(range(n), size):
-                chosen = [clusters[i] for i in combo_idx]
-                total = sum(val for val, _ in chosen)
-                subsets.append((chosen, total))
-        return subsets
-
-    subsets_a = gen_subsets(clusters_a, max_subset_size)
-    subsets_b = gen_subsets(clusters_b, max_subset_size)
-
-    matches = []
-    for subset_a, total_a in subsets_a:
-        for subset_b, total_b in subsets_b:
-            diff = abs(total_a - total_b)
-            tolerance = max(total_a, total_b, 1) * tolerance_ratio
-            if diff <= tolerance:
-                matches.append((subset_a, subset_b, total_a, total_b, diff))
-
-    # Best (closest) matches first, preferring simpler combos when tied
-    matches.sort(key=lambda m: (round(m[4], 2), len(m[0]) + len(m[1])))
-
-    seen = set()
-    unique_matches = []
-    for subset_a, subset_b, total_a, total_b, diff in matches:
-        signature = (
-            frozenset(val for val, _ in subset_a),
-            frozenset(val for val, _ in subset_b),
-        )
-        if signature in seen:
-            continue
-        seen.add(signature)
-        unique_matches.append((subset_a, subset_b, total_a, total_b, diff))
-        if len(unique_matches) >= max_results:
-            break
-
-    return unique_matches
-
-
-def find_best_removal_subsets(items, target_diff, max_options=3):
-    """
-    Find up to `max_options` distinct subsets of `items` whose combined value is
-    closest to target_diff. Removing any one of these subsets would balance the trade.
-    Priority items (is_priority=True) are NEVER included in the removable pool.
-    Results are ranked by closeness to target, then by fewest items removed.
-    Brute force — fine for small item counts (capped at 15 for safety).
-    """
-    removable_items = [item for item in items if not item[2]]
-
-    if not removable_items or len(removable_items) > 15:
-        return []
-
-    all_subsets = []
-    n = len(removable_items)
-    for mask in range(1, 1 << n):
-        subset = [removable_items[i] for i in range(n) if mask & (1 << i)]
-        subset_value = sum(v for _, v, _, _ in subset)
-        diff_from_target = abs(subset_value - target_diff)
-        all_subsets.append((subset, diff_from_target))
-
-    # Sort by closeness to target first, then prefer fewer items removed
-    all_subsets.sort(key=lambda x: (round(x[1], 2), len(x[0])))
-
-    # Only keep subsets with genuinely distinct item sets (dedupe by item names)
-    seen_signatures = set()
-    unique_options = []
-    for subset, diff_from_target in all_subsets:
-        signature = frozenset(n for n, _, _, _ in subset)
-        if signature in seen_signatures:
-            continue
-        seen_signatures.add(signature)
-        unique_options.append((subset, diff_from_target))
-        if len(unique_options) >= max_options:
-            break
-
-    return unique_options
-
-
-def format_items(items):
-    return ", ".join(f"⭐{n} ({d})" if p else f"{n} ({d})" for n, v, p, d in items)
-
-
-class FairTradeModal(discord.ui.Modal, title="Fair Trade Calculator"):
-    your_items = discord.ui.TextInput(
-        label="Your items",
-        style=discord.TextStyle.paragraph,
-        placeholder="Liquid Glass Filter:4\n*Subtle Blush - 1-2 Caps",
-        required=True,
-    )
-    their_items = discord.ui.TextInput(
-        label="Their items",
-        style=discord.TextStyle.paragraph,
-        placeholder="Pfish Trinket - 3 Caps\nOversized Witch Hat:2-3",
-        required=True,
-    )
-
-    def __init__(self, include_combos=False):
-        super().__init__()
-        self.include_combos = include_combos
-
-    async def on_submit(self, interaction: discord.Interaction):
-        your_list, your_errors = parse_items(self.your_items.value)
-        their_list, their_errors = parse_items(self.their_items.value)
-
-        if your_errors or their_errors:
-            bad = your_errors + their_errors
-            await interaction.response.send_message(
-                f"⚠️ Couldn't parse these entries (use `Name:Value` or `Name - Value Caps`): {', '.join(bad)}",
-                ephemeral=True
-            )
-            return
-
-        if not your_list or not their_list:
-            await interaction.response.send_message(
-                "⚠️ Please list at least one item on each side.",
-                ephemeral=True
-            )
-            return
-
-        your_total = sum(v for _, v, _, _ in your_list)
-        their_total = sum(v for _, v, _, _ in their_list)
-        diff = round(your_total - their_total, 2)
-
-        lines = [
-            f"**Your side:** {format_items(your_list)} — Total: **{your_total:g}**",
-            f"**Their side:** {format_items(their_list)} — Total: **{their_total:g}**",
-            "",
-        ]
-        if any(p for _, _, p, _ in your_list) or any(p for _, _, p, _ in their_list):
-            lines.append("⭐ = marked as a must-keep priority item (won't be suggested for removal)")
-        if any("-" in d for _, _, _, d in your_list) or any("-" in d for _, _, _, d in their_list):
-            lines.append("*(Ranged items use their midpoint value for calculations)*")
-        if lines[-1] != "":
-            lines.append("")
-
-        if diff == 0:
-            lines.append("✅ This trade is perfectly fair!")
-        else:
-            # "your"/"their" as possessive determiners for correct grammar
-            heavier_owner = "your" if diff > 0 else "their"
-            heavier_items = your_list if diff > 0 else their_list
-            target = abs(diff)
-
-            lines.append(f"⚖️ **{heavier_owner.capitalize()}** side is worth **{target:g}** more.")
-
-            options = find_best_removal_subsets(heavier_items, target, max_options=3)
-            if options:
-                if len(options) == 1:
-                    lines.append(f"\n💡 To balance it out, consider removing:")
-                else:
-                    lines.append(f"\n💡 A few ways to balance it out — remove:")
-
-                for i, (subset, subset_diff) in enumerate(options, start=1):
-                    subset_names = ", ".join(f"{n} ({d})" for n, v, _, d in subset)
-                    subset_value = sum(v for _, v, _, _ in subset)
-                    gap_note = ""
-                    if round(subset_diff, 2) != 0:
-                        gap_note = f" *(leaves a small gap of ~{round(subset_diff, 2):g})*"
-
-                    prefix = f"**Option {i}:**" if len(options) > 1 else "•"
-                    lines.append(f"{prefix} **{subset_names}** (worth {subset_value:g}) from {heavier_owner} side{gap_note}")
-            else:
-                removable_count = len([i for i in heavier_items if not i[2]])
-                if removable_count == 0:
-                    lines.append(
-                        f"\n💡 All items on {heavier_owner} side are marked as priority, "
-                        f"so consider adding roughly **{target:g}** worth of items to the lighter side instead."
-                    )
-                else:
-                    lines.append(f"\n💡 Consider adding roughly **{target:g}** worth of items to the lighter side instead.")
-
-        # Suggest smaller item groupings that could be traded against each other,
-        # separate from the overall balance check above — only if opted in
-        if self.include_combos:
-            combos = find_matching_combos(your_list, their_list)
-            if combos:
-                lines.append("\n🔀 **Possible ways to arrange the trade:**")
-                for subset_a, subset_b, total_a, total_b, combo_diff in combos:
-                    your_side_text = format_combo_side(subset_a)
-                    their_side_text = format_combo_side(subset_b)
-                    gap_note = "" if round(combo_diff, 2) == 0 else f" *(off by ~{round(combo_diff, 2):g})*"
-                    lines.append(f"• Your **{your_side_text}** ({total_a:g}) ≈ their **{their_side_text}** ({total_b:g}){gap_note}")
-
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-
-class FairTradeStartView(discord.ui.View):
-    """Shown before the modal so we have room for full instructions (modal labels cap at 45 characters)."""
-
-    def __init__(self):
-        super().__init__(timeout=120)
-
-    @discord.ui.button(label="Open Trade Form", style=discord.ButtonStyle.primary, emoji="📝")
-    async def open_form(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(FairTradeModal(include_combos=False))
-
-    @discord.ui.button(label="Open Form + Suggest Combos", style=discord.ButtonStyle.secondary, emoji="🔀")
-    async def open_form_with_combos(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_modal(FairTradeModal(include_combos=True))
-
-
-@bot.tree.command(name="fairtrade", description="Check if a Neocash trade is fair and get suggestions to balance it")
-async def fairtrade(interaction: discord.Interaction):
-    instructions = (
-        "🎨 **Fair Trade Calculator**\n\n"
-        "List each item on its own **line**, or separated by **commas**. Both work!\n\n"
-        "**Accepted formats:**\n"
-        "• `Item Name:Value` — e.g. `Liquid Glass Filter:4`\n"
-        "• `Item Name - Value Caps` — e.g. `Liquid Glass Filter - 4 Caps`\n\n"
-        "**Value can be a range too:**\n"
-        "• `Subtle Blush:1-2` or `Subtle Blush - 1-2 Caps` *(the midpoint is used for the math)*\n\n"
-        "**Quantities:** add `(x15)` after the value for multiples —\n"
-        "`Gift Box Capsule:1.5 (x15)` = 22.5 total\n\n"
-        "**Priority items:** put a `*` before the name to mark it as a must-keep —\n"
-        "`*Rare Item:5` — it will never be suggested for removal.\n\n"
-        "**Two ways to open the form:**\n"
-        "📝 **Open Trade Form** — just checks if the trade is fair overall\n"
-        "🔀 **Open Form + Suggest Combos** — also suggests smaller item groupings "
-        "that could be swapped against each other (e.g. \"your A + B ≈ their C\")"
-    )
-    await interaction.response.send_message(instructions, view=FairTradeStartView(), ephemeral=True)
-
-
-# ============================================================
-#  HELPER — check and ping for fresh giveaway
-# ============================================================
-
-async def maybe_ping_giveaway(message):
-    if message.channel.name != GIVEAWAY_CHANNEL:
-        return
-    if not message.author.bot:
-        return
-    if message.id in pinged_giveaways:
-        print(f"⏭️ Already pinged for message {message.id}, skipping")
-        return
-
-    author_role_names = [r.name for r in getattr(message.author, 'roles', [])]
-    if GIVEAWAY_BOT_ROLE not in author_role_names:
-        return
-
-    embed_text = ""
-    for embed in message.embeds:
-        if embed.title:
-            embed_text += embed.title + " "
-        if embed.description:
-            embed_text += embed.description + " "
-        if embed.footer and embed.footer.text:
-            embed_text += embed.footer.text + " "
-        for field in embed.fields:
-            embed_text += field.name + " " + field.value + " "
-
-    if "Ends:" in embed_text and "Ended:" not in embed_text:
-        ping_role = discord.utils.get(message.guild.roles, name=GIVEAWAY_PING_ROLE)
-        if ping_role:
-            pinged_giveaways.add(message.id)
-            await message.channel.send(ping_role.mention)
-            print(f"🎉 Pinged @{GIVEAWAY_PING_ROLE} for new giveaway in #{message.channel.name}")
-
-
-# ============================================================
-#  STARTUP ACTIVITY CHECK
-# ============================================================
-
-def has_sufficient_message_history() -> bool:
-    """Checks whether message_log has been running long enough (a full
-    ACTIVE_DURATION_DAYS window) to safely replace the old full-channel-scan
-    with a fast local lookup. Returns False until then, so the bot falls
-    back to the slower-but-reliable Discord history scan in the meantime."""
-    conn = get_db()
-    row = conn.execute("SELECT MIN(posted_at) as oldest FROM message_log").fetchone()
-    conn.close()
-
-    if row is None or row["oldest"] is None:
-        return False
-
-    oldest = datetime.fromisoformat(row["oldest"])
-    return (datetime.now(timezone.utc) - oldest).days >= ACTIVE_DURATION_DAYS
-
-
-async def startup_activity_check():
-    await bot.wait_until_ready()
-    print(f"🔍 Running startup activity check...")
-
-    use_local_data = has_sufficient_message_history()
-    if use_local_data:
-        print("📊 message_log has enough history — using the fast local lookup instead of scanning Discord")
-    else:
-        print("📊 message_log doesn't have a full 30-day history yet — falling back to the slower full channel scan for now")
-
-    for guild in bot.guilds:
-        # Force a full member list load — the automatic chunking Discord
-        # does in the background isn't always finished by the time this
-        # runs, which can otherwise make guild.members look empty.
-        if not guild.chunked:
-            await guild.chunk()
-
-        active_role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
-        if not active_role:
-            print(f"⚠️ Role '{ACTIVE_ROLE_NAME}' not found in {guild.name}")
-            continue
-
-        valid_channels = [
-            c for c in guild.text_channels
-            if c.name not in IGNORED_CHANNELS
-            and c.name != GIVEAWAY_CHANNEL
-        ]
-
-        active_members = [m for m in guild.members if active_role in m.roles]
-        print(f"📋 Checking {len(active_members)} members with Active role...")
-
-        cutoff = datetime.now(timezone.utc) - timedelta(days=ACTIVE_DURATION_DAYS)
-        last_post_map = {}
-
-        if use_local_data:
-            # Fast path: message_log already tracks this continuously and
-            # respects the same channel exclusions (IGNORED_CHANNELS and the
-            # giveaway channel never get logged there in the first place).
-            conn = get_db()
-            rows = conn.execute(
-                "SELECT user_id, MAX(posted_at) as last_post FROM message_log WHERE posted_at >= ? GROUP BY user_id",
-                (cutoff.isoformat(),)
-            ).fetchall()
-            conn.close()
-            for row in rows:
-                last_post_map[row["user_id"]] = datetime.fromisoformat(row["last_post"])
-        else:
-            # Slow fallback: scan full channel history. Only used until
-            # message_log has accumulated a full 30-day window on its own.
-            for channel in valid_channels:
-                try:
-                    async for msg in channel.history(limit=None, after=cutoff, oldest_first=False):
-                        if msg.author.bot:
-                            continue
-                        existing = last_post_map.get(msg.author.id)
-                        if existing is None or msg.created_at > existing:
-                            last_post_map[msg.author.id] = msg.created_at
-                except Exception as e:
-                    print(f"⚠️ Could not scan #{channel.name}: {e}")
-                    continue
-
-        for member in active_members:
-            if member.bot:
-                continue
-
-            last_post = last_post_map.get(member.id)
-
-            if last_post:
-                expiry = last_post + timedelta(days=ACTIVE_DURATION_DAYS)
-                expiry_times[member.id] = expiry
-                print(f"✅ {member.display_name} — last post {last_post.strftime('%Y-%m-%d')}, expires {expiry.strftime('%Y-%m-%d')}")
-            else:
-                try:
-                    await member.remove_roles(active_role)
-                    print(f"⏰ Removed '{ACTIVE_ROLE_NAME}' from {member.display_name} (no posts in 30 days)")
-                except Exception as e:
-                    print(f"⚠️ Could not remove role from {member.display_name}: {e}")
-
-        # Also check anyone who posted recently but is MISSING the Active role
-        # (e.g. wrongly removed by a previous buggy run) and restore it
-        active_member_ids = {m.id for m in active_members}
-        for user_id, last_post in last_post_map.items():
-            if user_id in active_member_ids:
-                continue  # already handled above
-
-            member = guild.get_member(user_id)
-            if not member or member.bot:
-                continue
-
-            try:
-                await member.add_roles(active_role)
-                expiry = last_post + timedelta(days=ACTIVE_DURATION_DAYS)
-                expiry_times[member.id] = expiry
-                print(f"🔧 Restored 'Active' to {member.display_name} — last post {last_post.strftime('%Y-%m-%d')} (was missing the role)")
-            except Exception as e:
-                print(f"⚠️ Could not restore role for {member.display_name}: {e}")
-
-    print(f"✅ Startup activity check complete!")
-
-
-# ============================================================
-#  EVENTS
-# ============================================================
-
-_startup_complete = False
-
-@bot.event
-async def on_ready():
-    global _startup_complete
-    print(f"✅ Logged in as {bot.user}")
-
-    if _startup_complete:
-        print("🔄 on_ready fired again (likely a reconnect) — setup already done, skipping to avoid duplicate tasks")
-        return
-    _startup_complete = True
-
-    print(f"📋 Watching for activity | Role: '{ACTIVE_ROLE_NAME}' | Window: {ACTIVE_DURATION_DAYS} days")
-
-    # Load persisted art trade pool from SQLite
-    global art_trade_pool
-    art_trade_pool = db_load_all_entries()
-    print(f"🎨 Loaded {len(art_trade_pool)} art trade entries from database")
-
-    try:
-        synced = await bot.tree.sync()
-        print(f"🔄 Synced {len(synced)} slash commands")
-    except Exception as e:
-        print(f"⚠️ Failed to sync slash commands: {e}")
-
-    # Fully load every guild's member list BEFORE starting any background
-    # tasks — otherwise multiple tasks starting at once can each race to
-    # chunk the same guild independently, and some can end up running
-    # against an incomplete member list.
-    for guild in bot.guilds:
-        print(f"📥 Checking member list for {guild.name} (already loaded: {guild.chunked})...")
-        if not guild.chunked:
-            await guild.chunk()
-        print(f"✅ {guild.name} ready ({len(guild.members)} members)")
-
-    bot.loop.create_task(check_expirations())
-    bot.loop.create_task(startup_activity_check())
-    bot.loop.create_task(food_club_check_loop())
-    bot.loop.create_task(activity_sync_loop())
-    bot.loop.create_task(prune_message_log_loop())
-    bot.loop.create_task(threshold_recalc_loop())
-    bot.loop.create_task(purge_check_loop())
-    bot.loop.create_task(bc_entries_clear_loop())
-    bot.loop.create_task(pending_alerts_loop())
-    bot.loop.create_task(birthday_check_loop())
-    points.start_background(bot)
-    contest.start_background(bot)
-    calendar_sync.start_background(bot, get_db, MAIN_GUILD_NAME) 
-    santa.start_background(bot)
-    
-
-
-@bot.event
-async def on_message(message):
-    if message.guild is None:
-        return
-
-    # --------------------------------------------------------
-    #  GIVEAWAY CHANNEL
-    # --------------------------------------------------------
-    if message.channel.name == GIVEAWAY_CHANNEL:
-
-        if message.author == bot.user:
-            return
-
-        if message.author.bot:
-            await maybe_ping_giveaway(message)
-            return
-
-        async def delayed_delete(msg):
-            await asyncio.sleep(GIVEAWAY_DELETE_SECONDS)
-            try:
-                await msg.delete()
-                print(f"🗑️ Silently deleted message from {msg.author.display_name} in #{msg.channel.name}")
-            except Exception as e:
-                print(f"⚠️ Could not delete message: {e}")
-
-        asyncio.ensure_future(delayed_delete(message))
-        return
-
-    if message.author.bot:
-        return
-
-    if message.channel.name in IGNORED_CHANNELS:
-        return
-
-    # --------------------------------------------------------
-    #  ACTIVITY LOGGING (for the mod-only activity tracker)
-    # --------------------------------------------------------
-    now_iso = datetime.now(timezone.utc).isoformat()
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO message_log (user_id, channel_name, posted_at) VALUES (?, ?, ?)",
-        (message.author.id, message.channel.name, now_iso)
-    )
-    # Permanent last-seen record — never pruned, so the 6-month purge check
-    # still works correctly even past the rolling activity window.
-    conn.execute("""
-        INSERT INTO member_last_seen (user_id, last_seen_at) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
-    """, (message.author.id, now_iso))
-    # If they were flagged for the inactivity purge, they've clearly come
-    # back — clear it so mods aren't looking at a stale flag.
-    conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (message.author.id,))
-    conn.commit()
-    conn.close()
-
-    # --------------------------------------------------------
-    #  EVENT POINTS
-    # --------------------------------------------------------
-    await points.on_message_points(message)
-
-    # --------------------------------------------------------
-    #  ACTIVE ROLE TRACKING
-    # --------------------------------------------------------
-    member = message.author
-    role = discord.utils.get(message.guild.roles, name=ACTIVE_ROLE_NAME)
-
-    if role is None:
-        print(f"⚠️  Role '{ACTIVE_ROLE_NAME}' not found. Check the name matches exactly.")
-        return
-
-    expiry = datetime.now(timezone.utc) + timedelta(days=ACTIVE_DURATION_DAYS)
-    expiry_times[member.id] = expiry
-
-    if role not in member.roles:
-        await member.add_roles(role)
-        print(f"✅ Gave '{ACTIVE_ROLE_NAME}' to {member.display_name}")
-
-
-@bot.event
-async def on_message_edit(before, after):
-    if after.guild is None:
-        return
-    if after.channel.name != GIVEAWAY_CHANNEL:
-        return
-    if not after.author.bot:
-        return
-    await maybe_ping_giveaway(after)
-
-
-# ============================================================
-#  BACKGROUND TASK — checks for expired roles every hour
-# ============================================================
-
-async def check_expirations():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        now = datetime.now(timezone.utc)
-        to_remove = [uid for uid, exp in expiry_times.items() if now >= exp]
-
-        for user_id in to_remove:
-            del expiry_times[user_id]
-            for guild in bot.guilds:
-                member = guild.get_member(user_id)
-                if member:
-                    role = discord.utils.get(guild.roles, name=ACTIVE_ROLE_NAME)
-                    if role and role in member.roles:
-                        await member.remove_roles(role)
-                        print(f"⏰ Removed '{ACTIVE_ROLE_NAME}' from {member.display_name} (inactive 30 days)")
-
-        await asyncio.sleep(3600)  # Check every hour
-
-
-# ============================================================
-#  FOOD CLUB OUTLOOK CHECKER
-# ============================================================
-
-ATOM_NS = "{http://www.w3.org/2005/Atom}"
-
-REDDIT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
-}
-
-
-async def fetch_rss(url, retries=2, backoff_seconds=8):
-    """
-    Fetch and parse an Atom/RSS feed. Returns the parsed XML root, or None on failure.
-    Retries on 429 (rate limited) with a short backoff, and falls back to
-    old.reddit.com if www.reddit.com is being blocked.
-    """
-    urls_to_try = [url]
-    if "www.reddit.com" in url:
-        urls_to_try.append(url.replace("www.reddit.com", "old.reddit.com"))
-
-    for attempt_url in urls_to_try:
-        for attempt in range(retries + 1):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        attempt_url, headers=REDDIT_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
-                    ) as resp:
-                        if resp.status == 200:
-                            text = await resp.text()
-                            try:
-                                return ET.fromstring(text)
-                            except ET.ParseError as e:
-                                print(f"⚠️ Food Club: couldn't parse RSS feed — {e}")
-                                return None
-                        elif resp.status == 429:
-                            print(f"⚠️ Food Club: rate limited (429) on {attempt_url}, attempt {attempt + 1}/{retries + 1}")
-                            if attempt < retries:
-                                await asyncio.sleep(backoff_seconds)
-                        else:
-                            print(f"⚠️ Food Club: RSS returned status {resp.status} for {attempt_url}")
-                            break  # non-429 error, no point retrying this URL
-            except Exception as e:
-                print(f"⚠️ Food Club: couldn't reach {attempt_url} — {e}")
-                break
-
-    return None
-
-
-async def find_todays_food_club_thread():
-    """
-    Search r/neopets for today's AutoModerator 'Food Club Bets' thread.
-    Returns the thread's URL, or None if it hasn't been posted yet.
-    """
-    from urllib.parse import quote
-    query = quote('title:"Food Club Bets"')
-    search_url = f"https://www.reddit.com/r/neopets/search.rss?q={query}&restrict_sr=on&sort=new&limit=5"
-
-    root = await fetch_rss(search_url)
-    if root is None:
-        return None
-
-    now = datetime.now(timezone.utc)
-    today_labels = {now.strftime("%B %-d, %Y").lower(), now.strftime("%B %d, %Y").lower()}
-
-    for entry in root.findall(f"{ATOM_NS}entry"):
-        title_el = entry.find(f"{ATOM_NS}title")
-        title = (title_el.text or "") if title_el is not None else ""
-        title_lower = title.lower()
-
-        if "food club bets" not in title_lower:
-            continue
-        if not any(label in title_lower for label in today_labels):
-            continue
-
-        link_el = entry.find(f"{ATOM_NS}link")
-        if link_el is not None:
-            return link_el.get("href")
-
-    return None
-
-
-async def fetch_food_club_outlook():
-    """
-    Find today's AutoModerator Food Club Bets thread, then look for u/nsheng's
-    comment inside it containing the outlook.
-    Returns (outlook_text, comment_url, is_skip_day) if found, or
-    (None, None, False) if the thread or comment isn't up yet, or
-    something went wrong.
-    """
-    thread_url = await find_todays_food_club_thread()
-    if not thread_url:
-        return None, None, False
-
-    await asyncio.sleep(3)  # brief pause between requests to be gentle on Reddit's rate limits
-
-    comments_rss_url = thread_url if thread_url.endswith("/") else thread_url + "/"
-    comments_rss_url += ".rss"
-
-    root = await fetch_rss(comments_rss_url)
-    if root is None:
-        return None, None, False
-
-    for entry in root.findall(f"{ATOM_NS}entry"):
-        author_el = entry.find(f"{ATOM_NS}author/{ATOM_NS}name")
-        author = (author_el.text or "") if author_el is not None else ""
-
-        if FOOD_CLUB_REDDIT_USER.lower() not in author.lower():
-            continue
-
-        content_el = entry.find(f"{ATOM_NS}content")
-        content_html = (content_el.text or "") if content_el is not None else ""
-
-        # Check for a "skipping this round" mention anywhere in the comment —
-        # strip HTML tags first so a phrase split across tags still matches
-        plain_text = re.sub(r"<[^>]+>", " ", content_html)
-        is_skip_day = bool(re.search(r"sets?\W+(?:are\W+)?skipping", plain_text, re.IGNORECASE))
-
-        match = re.search(r"outlook for this round:\s*([^<\n]+)", content_html, re.IGNORECASE)
-        if not match and not is_skip_day:
-            continue
-
-        outlook_text = html.unescape(match.group(1).strip()) if match else None
-
-        link_el = entry.find(f"{ATOM_NS}link")
-        comment_url = link_el.get("href") if link_el is not None else thread_url
-
-        return outlook_text, comment_url, is_skip_day
-
-    print(f"🥕 Food Club: found today's thread but no matching comment from u/{FOOD_CLUB_REDDIT_USER} yet")
-    return None, None, False
-
-
-async def run_food_club_check():
-    """
-    Runs a single Food Club check cycle: fetch and post today's outlook.
-    Posts every day regardless of risk/return level — just the outlook text,
-    no bet links, no pings. Returns a short summary string describing what
-    happened. Used by both the background loop and the /foodclubreset command.
-    """
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    existing = db_get_food_club_status(today_str)
-
-    if existing is not None:
-        msg = f"Already checked {today_str} (outlook was: '{existing['outlook']}')"
-        print(f"🥕 Food Club: {msg} — waiting until tomorrow")
-        return msg
-
-    outlook_text, post_url, is_skip_day = await fetch_food_club_outlook()
-
-    if is_skip_day:
-        print(f"🥕 Food Club: nsheng mentioned all sets skipping today")
-        posted_anywhere = False
-        for guild in bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
-            if channel:
-                try:
-                    await channel.send("🥕 nsheng mentioned all sets are skipping this round.")
-                    posted_anywhere = True
-                except Exception as e:
-                    print(f"⚠️ Food Club: couldn't send message — {e}")
-
-        db_set_food_club_status(today_str, "Skip day — all sets skipping", False)
-        return "Skip day detected (nsheng mentioned all sets skipping)" + (" — posted" if posted_anywhere else " — couldn't find channel")
-
-    elif outlook_text:
-        # Strip any trailing period/exclamation from nsheng's text so our
-        # own formatting doesn't collide with his punctuation
-        outlook_display = outlook_text.rstrip(" .!")
-
-        posted_anywhere = False
-        for guild in bot.guilds:
-            channel = discord.utils.get(guild.text_channels, name=FOOD_CLUB_CHANNEL)
-            if channel:
-                try:
-                    await channel.send(f"🥕 Today's Food Club outlook: **{outlook_display}**")
-                    posted_anywhere = True
-                    print(f"🥕 Posted — outlook: {outlook_text}")
-                except Exception as e:
-                    print(f"⚠️ Food Club: couldn't send message — {e}")
-
-        db_set_food_club_status(today_str, outlook_text, False)
-        if posted_anywhere:
-            return f"Posted! Outlook: '{outlook_text}'"
-        else:
-            return f"Found outlook ('{outlook_text}') but couldn't find the channel to post in"
-    else:
-        msg = f"No post found for {today_str} yet"
-        print(f"🥕 Food Club: {msg}, will check again in {FOOD_CLUB_CHECK_INTERVAL_HOURS}h")
-        return msg
-
-
-async def food_club_check_loop():
-    await bot.wait_until_ready()
-
-    while not bot.is_closed():
-        await run_food_club_check()
-        await asyncio.sleep(FOOD_CLUB_CHECK_INTERVAL_HOURS * 3600)
-
-
-# ============================================================
-#  ACTIVITY TRACKER — computes tiers and pushes them to the
-#  mod-only page on the website. Nothing here is visible to
-#  regular members; it's purely a check-in tool for staff.
-# ============================================================
-
-def get_current_thresholds():
-    """Returns (high_threshold, medium_threshold, computed_at) — falls back
-    to the starting defaults until enough real data exists to compute from."""
-    conn = get_db()
-    row = conn.execute("SELECT * FROM activity_thresholds WHERE id = 1").fetchone()
-    conn.close()
-
-    if row is None:
-        return (DEFAULT_HIGH_THRESHOLD, DEFAULT_MEDIUM_THRESHOLD, None)
-    return (row["high_threshold"], row["medium_threshold"], row["computed_at"])
-
-
-def recalculate_activity_thresholds():
-    """Looks at every member's actual posting rate over the trailing 6-month
-    window and derives the Really Active / Active cutoffs from real
-    percentiles, instead of a fixed guess. Runs monthly — slow on purpose,
-    so it can't quietly absorb a real decline the way a fast-reacting
-    baseline could."""
-    conn = get_db()
-    window_start = (datetime.now(timezone.utc) - timedelta(days=THRESHOLD_BASELINE_WINDOW_DAYS)).isoformat()
-
-    rows = conn.execute(
-        "SELECT user_id, COUNT(*) as cnt FROM message_log WHERE posted_at >= ? GROUP BY user_id",
-        (window_start,)
-    ).fetchall()
-
-    daily_rates = sorted((r["cnt"] / THRESHOLD_BASELINE_WINDOW_DAYS) for r in rows)
-    sample_size = len(daily_rates)
-
-    if sample_size < THRESHOLD_MIN_SAMPLE_SIZE:
-        conn.close()
-        print(f"📊 Threshold recalc skipped — only {sample_size} members with data, need {THRESHOLD_MIN_SAMPLE_SIZE}")
-        return
-
-    high_idx = min(int(sample_size * THRESHOLD_HIGH_PERCENTILE), sample_size - 1)
-    medium_idx = min(int(sample_size * THRESHOLD_MEDIUM_PERCENTILE), sample_size - 1)
-    high_threshold = round(daily_rates[high_idx], 1)
-    medium_threshold = round(daily_rates[medium_idx], 1)
-
-    # Sanity guard: high should never end up below medium (can happen with
-    # small/lopsided samples) — if so, just keep the previous thresholds.
-    if high_threshold <= medium_threshold:
-        conn.close()
-        print(f"📊 Threshold recalc skipped — computed high ({high_threshold}) <= medium ({medium_threshold}), keeping previous values")
-        return
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    conn.execute("""
-        INSERT INTO activity_thresholds (id, high_threshold, medium_threshold, sample_size, computed_at)
-        VALUES (1, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            high_threshold = excluded.high_threshold,
-            medium_threshold = excluded.medium_threshold,
-            sample_size = excluded.sample_size,
-            computed_at = excluded.computed_at
-    """, (high_threshold, medium_threshold, sample_size, now_iso))
-    conn.commit()
-    conn.close()
-    print(f"📊 Recalculated activity thresholds from {sample_size} members: High={high_threshold}/day, Medium={medium_threshold}/day")
-
-
-async def threshold_recalc_loop():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        recalculate_activity_thresholds()
-        await asyncio.sleep(THRESHOLD_RECALC_INTERVAL_DAYS * 24 * 3600)
-
-
-# ============================================================
-#  INACTIVITY PURGE NOTIFICATIONS
-#  Flags members who've been fully silent for 6+ months (12+ if on
-#  hiatus) so mods know to review them — never removes anyone
-#  automatically. Server boosters are fully immune while boosting.
-# ============================================================
-
-async def fetch_hiatus_discord_ids() -> set:
-    """Pulls the current hiatus list from the website (set via mod_activity.php),
-    so this stays the single source of truth rather than a separate bot-side list."""
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(
-                HIATUS_LIST_URL,
-                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                data = await resp.json()
-                return set(data.get("discord_ids", []))
-        except Exception as e:
-            print(f"⚠️ Could not fetch hiatus list, treating nobody as on hiatus this run: {e}")
-            return set()
-
-
-def get_tracking_start_date():
-    """The earliest message_log timestamp — i.e. the moment message
-    tracking actually began. Returns None if no messages have ever
-    been logged yet."""
-    conn = get_db()
-    row = conn.execute("SELECT MIN(posted_at) as oldest FROM message_log").fetchone()
-    conn.close()
-    if row is None or row["oldest"] is None:
-        return None
-    return datetime.fromisoformat(row["oldest"])
-
-
-async def run_purge_check():
-    if not ACTIVITY_SYNC_SECRET:
-        print("⚠️ ACTIVITY_SYNC_SECRET not set — skipping purge check")
-        return
-
-    hiatus_ids = await fetch_hiatus_discord_ids()
-    now = datetime.now(timezone.utc)
-    tracking_start = get_tracking_start_date()
-    conn = get_db()
-
-    for guild in bot.guilds:
-        if not guild.chunked:
-            await guild.chunk()
-
-        alert_channel = discord.utils.get(guild.text_channels, name=STRIKE_ALERT_CHANNEL)
-
-        for member in guild.members:
-            if member.bot:
-                continue
-
-            # Server boosters are fully immune while currently boosting.
-            if member.premium_since is not None:
-                continue
-
-            row = conn.execute(
-                "SELECT last_seen_at FROM member_last_seen WHERE user_id = ?",
-                (member.id,)
-            ).fetchone()
-
-            if row:
-                last_activity = datetime.fromisoformat(row["last_seen_at"])
-            elif tracking_start is None:
-                # No message tracking data exists at all yet anywhere —
-                # can't make a reliable call for anyone, skip entirely.
-                continue
-            elif member.joined_at and member.joined_at > tracking_start:
-                # They joined AFTER tracking began and still have never
-                # posted — join date is a genuinely reliable reference here.
-                last_activity = member.joined_at
-            else:
-                # They were already in the server before tracking began,
-                # and we have no record of them posting since. We can't
-                # know their TRUE last message — it could easily predate
-                # tracking and be much more recent than their join date.
-                # Only treat this as real silence once we've directly
-                # observed a full threshold's worth of time with no
-                # activity from them since tracking started.
-                days_observed = (now - tracking_start).days
-                threshold_days_needed = PURGE_HIATUS_THRESHOLD_DAYS if str(member.id) in hiatus_ids else PURGE_THRESHOLD_DAYS
-                if days_observed < threshold_days_needed:
-                    continue
-                last_activity = tracking_start
-
-            on_hiatus = str(member.id) in hiatus_ids
-            threshold_days = PURGE_HIATUS_THRESHOLD_DAYS if on_hiatus else PURGE_THRESHOLD_DAYS
-            days_silent = (now - last_activity).days
-
-            already_flagged = conn.execute(
-                "SELECT 1 FROM purge_flags WHERE user_id = ?", (member.id,)
-            ).fetchone()
-
-            if days_silent >= threshold_days and not already_flagged:
-                conn.execute(
-                    "INSERT INTO purge_flags (user_id, flagged_at, reason) VALUES (?, ?, ?)",
-                    (member.id, now.isoformat(), f"{days_silent} days silent")
-                )
-                conn.commit()
-
-                hiatus_note = " (was on hiatus — got the extended window)" if on_hiatus else ""
-                if alert_channel:
-                    await alert_channel.send(
-                        f"🕸️ **{member.display_name}** has been silent for **{days_silent} days**"
-                        f"{hiatus_note} — past the inactivity threshold. Might be time to review/remove them."
-                    )
-                else:
-                    print(f"⚠️ Alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post purge flag for {member.display_name}")
-
-    conn.close()
-
-
-async def purge_check_loop():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        await run_purge_check()
-        await asyncio.sleep(PURGE_CHECK_INTERVAL_HOURS * 3600)
-
-
-# ============================================================
-#  MEMBER REMOVALS TRACKER — logs bans and confirmed inactivity
-#  purges to the website immediately as they happen, feeding the
-#  combined Member Removals page.
-# ============================================================
-
-async def log_removal(discord_id: int, display_name: str, removal_type: str, reason: str | None):
-    if not ACTIVITY_SYNC_SECRET:
-        print("⚠️ ACTIVITY_SYNC_SECRET not set — skipping removal log")
-        return
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                REMOVAL_LOG_URL,
-                json={
-                    "discord_id": str(discord_id),
-                    "display_name": display_name,
-                    "removal_type": removal_type,
-                    "reason": reason,
-                },
-                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                pass
-        except Exception as e:
-            print(f"⚠️ Could not log removal ({removal_type}) for {display_name}: {e}")
-
-
-@bot.event
-async def on_member_ban(guild, user):
-    reason = None
-    try:
-        async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=5):
-            if entry.target and entry.target.id == user.id:
-                reason = entry.reason
-                break
-    except discord.Forbidden:
-        print("⚠️ Missing 'View Audit Log' permission — logging ban without a reason")
-
-    await log_removal(user.id, str(user), "ban", reason or "No reason recorded")
-
-
-@bot.event
-async def on_member_remove(member):
-    # Only log this as a "purge" if they were actually flagged for
-    # inactivity — a normal voluntary departure isn't a purge.
-    conn = get_db()
-    row = conn.execute("SELECT reason FROM purge_flags WHERE user_id = ?", (member.id,)).fetchone()
-    if row:
-        conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (member.id,))
-        conn.commit()
-    conn.close()
-
-    if row:
-        await log_removal(member.id, member.display_name, "purge", row["reason"])
-
-
-# ============================================================
-#  PENDING ALERTS — the website can't post to Discord directly (e.g.
-#  a strike added on the site crossing the threshold), so it queues a
-#  message here and the bot checks/posts it every few minutes.
-# ============================================================
-
-async def check_pending_alerts():
-    if not ACTIVITY_SYNC_SECRET:
-        return
-
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                PENDING_ALERTS_URL,
-                json={},
-                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                result = await resp.json()
-        except Exception as e:
-            print(f"⚠️ Could not check pending alerts: {e}")
-            return
-
-    messages = result.get("messages", [])
-    if not messages:
-        return
-
-    for guild in bot.guilds:
-        if guild.name != MAIN_GUILD_NAME:
-            continue
-        alert_channel = discord.utils.get(guild.text_channels, name=STRIKE_ALERT_CHANNEL)
-        if alert_channel:
-            for msg in messages:
-                await alert_channel.send(msg)
-        else:
-            print(f"⚠️ Alert channel '{STRIKE_ALERT_CHANNEL}' not found — couldn't post pending alerts")
-
-
-async def pending_alerts_loop():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        await check_pending_alerts()
-        await asyncio.sleep(PENDING_ALERTS_CHECK_INTERVAL_MINUTES * 60)
-
-
-def get_tracking_window_days() -> float:
-    """How many days of real message_log history actually exist so far,
-    capped at 30. Prevents dividing by a full 30 days before the tracker
-    has actually been running that long, which would make everyone look
-    far less active than they really are in the first few weeks."""
-    conn = get_db()
-    row = conn.execute("SELECT MIN(posted_at) as oldest FROM message_log").fetchone()
-    conn.close()
-
-    if row is None or row["oldest"] is None:
-        return 1 / 24  # no data at all yet — treat as a tiny window, not zero
-
-    oldest = datetime.fromisoformat(row["oldest"])
-    days_tracked = (datetime.now(timezone.utc) - oldest).total_seconds() / 86400
-    return max(min(days_tracked, 30), 1 / 24)
-
-
-def compute_member_activity(user_id: int):
-    """Returns (tier, avg_daily_messages, last_seen_iso, last_channel) for one user."""
-    conn = get_db()
-    now = datetime.now(timezone.utc)
-    window_start = (now - timedelta(days=30)).isoformat()
-
-    row = conn.execute(
-        "SELECT COUNT(*) as cnt FROM message_log WHERE user_id = ? AND posted_at >= ?",
-        (user_id, window_start)
-    ).fetchone()
-    tracking_days = get_tracking_window_days()
-    avg_daily = round((row["cnt"] or 0) / tracking_days, 1)
-
-    last_row = conn.execute(
-        "SELECT channel_name, posted_at FROM message_log WHERE user_id = ? ORDER BY posted_at DESC LIMIT 1",
-        (user_id,)
-    ).fetchone()
-    conn.close()
-
-    if last_row is None:
-        return ("Rarely Posts", 0.0, None, None)
-
-    last_seen = datetime.fromisoformat(last_row["posted_at"])
-    days_since = (now - last_seen).days
-
-    high_threshold, medium_threshold, _ = get_current_thresholds()
-
-    if days_since >= 30:
-        tier = "Rarely Posts"
-    elif days_since >= 15:
-        tier = "Occasional"
-    elif avg_daily >= high_threshold:
-        tier = "Really Active"
-    elif avg_daily >= medium_threshold:
-        tier = "Active"
-    else:
-        tier = "Occasional"
-
-    return (tier, avg_daily, last_row["posted_at"], last_row["channel_name"])
-
-
-async def sync_activity_once():
-    if not ACTIVITY_SYNC_SECRET:
-        print("⚠️ ACTIVITY_SYNC_SECRET not set — skipping activity sync")
-        return
-
-    for guild in bot.guilds:
-        if not guild.chunked:
-            await guild.chunk()
-
-        updates = []
-        for member in guild.members:
-            if member.bot:
-                continue
-            tier, avg_daily, last_seen, last_channel = compute_member_activity(member.id)
-            updates.append({
-                "discord_id": str(member.id),
-                "display_name": member.display_name,
-                "tier": tier,
-                "avg_daily_messages": avg_daily,
-                "last_seen_at": last_seen,
-                "last_channel": last_channel,
-            })
-
-        if not updates:
-            continue
-
-        high_threshold, medium_threshold, computed_at = get_current_thresholds()
-
-        payload = {
-            "updates": updates,
-            "thresholds": {
-                "high_threshold": high_threshold,
-                "medium_threshold": medium_threshold,
-                "computed_at": computed_at,
-            },
-        }
-
-        # Member count/cap only makes sense for your actual guild, not the test servers
-        if guild.name == MAIN_GUILD_NAME:
-            payload["total_members"] = len([m for m in guild.members if not m.bot])
-
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.post(
-                    ACTIVITY_SYNC_URL,
-                    json=payload,
-                    headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    result = await resp.json()
-                    if 'error' in result:
-                        print(f"📊 Activity sync REJECTED by server: {result['error']}")
-                    else:
-                        print(f"📊 Activity sync: {result.get('updated', 0)} members updated")
-            except Exception as e:
-                print(f"⚠️ Activity sync failed: {e}")
-
-
-async def activity_sync_loop():
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        await sync_activity_once()
-        await asyncio.sleep(ACTIVITY_SYNC_INTERVAL_HOURS * 3600)
-
-
-async def prune_message_log_loop():
-    """Keeps message_log from growing forever — deletes anything older
-    than the retention window once a day."""
-    await bot.wait_until_ready()
-    while not bot.is_closed():
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=MESSAGE_LOG_RETENTION_DAYS)).isoformat()
-        conn = get_db()
-        conn.execute("DELETE FROM message_log WHERE posted_at < ?", (cutoff,))
-        conn.commit()
-        conn.close()
-        await asyncio.sleep(24 * 3600)
-
-
-# ============================================================
-#  STRIKE SYSTEM — strikes now live in the shared website
-#  database, not the bot's local SQLite. This means Discord
-#  commands and the website's own Strikes page always agree.
-# ============================================================
-
-STRIKES_GET_URL = os.environ.get("STRIKES_GET_URL", "https://mods.athenaeumarchive.com/strikes_get_active.php")
-STRIKES_ADD_URL = os.environ.get("STRIKES_ADD_URL", "https://mods.athenaeumarchive.com/strikes_add.php")
-STRIKES_REMOVE_URL = os.environ.get("STRIKES_REMOVE_URL", "https://mods.athenaeumarchive.com/strikes_remove.php")
-
-
-async def get_active_strikes(user_id: int) -> list:
-    """Fetches active strikes from the shared website database."""
-    if not ACTIVITY_SYNC_SECRET:
-        print("⚠️ ACTIVITY_SYNC_SECRET not set — can't reach the strikes database")
-        return []
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                STRIKES_GET_URL,
-                json={"discord_id": str(user_id)},
-                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                result = await resp.json()
-                return result.get("strikes", [])
-        except Exception as e:
-            print(f"⚠️ Could not fetch active strikes: {e}")
-            return []
-
-
-async def get_strike_duration_days(user_id: int, strike_type: str) -> int:
-    """Checks the shared strike data to see if this member already has
-    an active strike of this same type — if so, the new one escalates
-    to a longer cooldown instead of the normal starting duration."""
-    active = await get_active_strikes(user_id)
-    has_active_of_type = any(s["strike_type"] == strike_type for s in active)
-
-    if strike_type == "temporary":
-        return TEMP_STRIKE_ESCALATED_DURATION_DAYS if has_active_of_type else TEMP_STRIKE_DURATION_DAYS
-    if strike_type == "minor_violation":
-        return MINOR_VIOLATION_ESCALATED_DURATION_DAYS if has_active_of_type else MINOR_VIOLATION_DURATION_DAYS
-    return 0  # permanent strikes don't expire, no duration needed
-
-
-async def add_strike_remote(user_id: int, strike_type: str, reason: str, issued_by: str, expires_at_iso) -> dict:
-    if not ACTIVITY_SYNC_SECRET:
-        return {"success": False}
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                STRIKES_ADD_URL,
-                json={
-                    "discord_id": str(user_id),
-                    "strike_type": strike_type,
-                    "reason": reason,
-                    "issued_by": issued_by,
-                    "expires_at": expires_at_iso,
-                },
-                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                return await resp.json()
-        except Exception as e:
-            print(f"⚠️ Could not add strike: {e}")
-            return {"success": False}
-
-
-async def remove_strike_remote(strike_id: int, user_id: int) -> dict:
-    if not ACTIVITY_SYNC_SECRET:
-        return {"success": False}
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.post(
-                STRIKES_REMOVE_URL,
-                json={"id": strike_id, "discord_id": str(user_id)},
-                headers={"X-Sync-Secret": ACTIVITY_SYNC_SECRET},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                return await resp.json()
-        except Exception as e:
-            print(f"⚠️ Could not remove strike: {e}")
-            return {"success": False}
-
-
-@bot.tree.command(name="strike", description="[Mod] Issue a strike to a member")
-@app_commands.describe(
-    member="Who this strike is for",
-    strike_type="Minor violations and temporary strikes both fade automatically; permanent ones don't",
-    reason="What happened",
-)
-@app_commands.choices(strike_type=[
-    app_commands.Choice(name="Minor Violation (30 days, or 90 if they already have one active)", value="minor_violation"),
-    app_commands.Choice(name="Temporary (45 days, or 90 if they already have one active)", value="temporary"),
-    app_commands.Choice(name="Permanent", value="permanent"),
-])
-async def strike(interaction: discord.Interaction, member: discord.Member, strike_type: app_commands.Choice[str], reason: str):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
-        return
-
-    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
-        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
-        return
-
-    now = datetime.now(timezone.utc)
-    escalated = False
-    escalated_duration = None
-
-    if strike_type.value in ("minor_violation", "temporary"):
-        duration_days = await get_strike_duration_days(member.id, strike_type.value)
-        escalated_duration = (
-            MINOR_VIOLATION_ESCALATED_DURATION_DAYS if strike_type.value == "minor_violation"
-            else TEMP_STRIKE_ESCALATED_DURATION_DAYS
-        )
-        escalated = duration_days == escalated_duration
-        expires_at = (now + timedelta(days=duration_days)).isoformat()
-    else:
-        expires_at = None
-
-    result = await add_strike_remote(member.id, strike_type.value, reason, str(interaction.user), expires_at)
-    if not result.get("success"):
-        await interaction.response.send_message(
-            f"⚠️ Couldn't reach the strikes database — the strike was NOT saved. Try again in a moment. ({result.get('error', 'unknown error')})",
-            ephemeral=True
-        )
-        return
-
-    active = await get_active_strikes(member.id)
-
-    escalation_note = ""
-    if escalated:
-        escalation_note = f"\n📈 This escalated to a **{escalated_duration}-day** cooldown since they still had an active one of this type."
-
-    threshold_note = ""
-    if len(active) >= STRIKE_ALERT_THRESHOLD:
-        threshold_note = "\n⚠️ Might be time for a serious conversation with them."
+        await push_web(event["id"])
+        return f"🎅 Done! {result['players']} people matched. Everyone can now see their giftee with the 🎅 button or `/santa match`."
 
     await interaction.response.send_message(
-        f"✅ {strike_type.name} strike issued to {member.display_name}. They now have **{len(active)}** active strike(s) total.{escalation_note}{threshold_note}",
-        ephemeral=False
-    )
+        f"Draw the matches for **{event['name']}** now? **{n}** people are signed up" + (f" and **{blocks}** pair{'s are' if blocks != 1 else ' is'} blocked" if blocks else "")
+        + "." + (f"\n⚠️ Sign-ups are still open until {_ts(event['signups_close_at'])}. Drawing closes them early." if early else "")
+        + "\nThis can't be redone.", view=_ConfirmView(interaction.user.id, do_draw), ephemeral=True)
 
 
-@bot.tree.command(name="strikes", description="[Mod] View a member's active strike history")
-@app_commands.describe(member="Whose strikes to look up")
-async def strikes(interaction: discord.Interaction, member: discord.Member):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+def _status_text(event):
+    c = counts(event["id"])
+    text = (f"🎅 **{event['name']}** ({_kind_label(event)}): {event['status']}"
+            + (f", opens {_ts(event['opens_at'], 'F')}" if event["status"] == "scheduled" else "") + f"\nSigned up: {c['signed_up']} · Blocked pairs: {len(blocked_pairs(event['id']))}\n"
+            f"Sign-ups close {_ts(event['signups_close_at'])} · Due {_ts(event['exchange_by'])}")
+    if event["status"] != "signups":
+        text += f"\nMatched: {c['matched']} · Sent: {c['sent']} · Received: {c['received']}"
+    return text
+
+
+@santa_group.command(name="status", description="[Mod] How the exchange(s) are going (counts only, no names)")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_status(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-
-    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
-        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+    if not exchange and len(active_events(True)) > 1:
+        text = "\n\n".join(_status_text(e) for e in active_events(True))
+        await interaction.response.send_message(text[:1990], ephemeral=True)
         return
-
-    active = await get_active_strikes(member.id)
-
-    if not active:
-        await interaction.response.send_message(f"{member.display_name} has no active strikes.", ephemeral=False)
+    event = await _pick_event(interaction, exchange, include_scheduled=True)
+    if not event:
         return
-
-    lines = [f"**Active strikes for {member.display_name}:**"]
-    for s in active:
-        if s["strike_type"] == "minor_violation":
-            type_label = f"Minor Violation (fades {s['expires_at'][:10]})"
-        elif s["strike_type"] == "temporary":
-            type_label = f"Temporary (fades {s['expires_at'][:10]})"
-        else:
-            type_label = "Permanent"
-        lines.append(f"`#{s['id']}` — **{type_label}** — {s['reason']} — issued by {s['issued_by']} on {s['issued_at'][:10]}")
-
-    await interaction.response.send_message("\n".join(lines), ephemeral=False)
+    await interaction.response.send_message(_status_text(event), ephemeral=True)
 
 
-@bot.tree.command(name="removestrike", description="[Mod] Remove a strike from a member")
-@app_commands.describe(member="Whose strike to remove", strike_id="Pick from the suggestions once you've chosen a member")
-async def removestrike(interaction: discord.Interaction, member: discord.Member, strike_id: int):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+@santa_group.command(name="remind", description="[Mod] Send a reminder to everyone who hasn't marked their gift sent")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_remind(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
         return
-
-    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
-        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+    event = await _pick_event(interaction, exchange, statuses=("drawn",),
+                              none_text="⚠️ Reminders only make sense after the draw and before the reveal.")
+    if not event:
         return
-
-    result = await remove_strike_remote(strike_id, member.id)
-
-    if result.get("removed"):
-        await interaction.response.send_message(f"✅ Strike `#{strike_id}` removed for {member.display_name}.", ephemeral=False)
-    else:
-        await interaction.response.send_message(f"⚠️ No strike with ID `#{strike_id}` found for {member.display_name}.", ephemeral=False)
-
-
-@removestrike.autocomplete('strike_id')
-async def removestrike_autocomplete(interaction: discord.Interaction, current: str):
-    member = interaction.namespace.member
-    if member is None:
-        return []
-
-    active = await get_active_strikes(member.id)
-    choices = []
-    for s in active:
-        label = f"#{s['id']} — {s['reason'][:60]}"
-        choices.append(app_commands.Choice(name=label, value=s['id']))
-    return choices[:25]
-
-
-@bot.tree.command(name="backfillactivity", description="[Mod] One-time: scan real message history to fill gaps in activity tracking")
-async def backfillactivity(interaction: discord.Interaction):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
-        return
-
     await interaction.response.defer(ephemeral=True)
-    await interaction.followup.send(
-        f"🔍 Scanning up to {PURGE_THRESHOLD_DAYS} days of message history across every channel — "
-        f"this can take several minutes on a busy server, possibly longer than Discord's 15-minute reply "
-        f"window. If you don't see a completion message here, check #{STRIKE_ALERT_CHANNEL} instead.",
-        ephemeral=True
-    )
+    delivered, failed = await remind_givers(event)
+    await interaction.followup.send(f"📨 Reminded {delivered} people." + (f" {failed} have private messages turned off, so I couldn't reach them." if failed else ""), ephemeral=True)
 
-    guild = interaction.guild
-    cutoff = datetime.now(timezone.utc) - timedelta(days=PURGE_THRESHOLD_DAYS)
 
-    valid_channels = [
-        c for c in guild.text_channels
-        if c.name not in IGNORED_CHANNELS
-        and c.name != GIVEAWAY_CHANNEL
-    ]
+@santa_group.command(name="lookup", description="[Mod] Emergency only: see one member's match. Always logged to the mod channel")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+@app_commands.describe(member="The member to look up")
+async def santa_lookup(interaction: discord.Interaction, member: discord.Member, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=False)
+    if not event:
+        return
+    ok, result = lookup_match(event["id"], interaction.user.id, member.id, _now())
+    if not ok:
+        await interaction.response.send_message(f"⚠️ {result}", ephemeral=True)
+        return
+    logged = await _mod_log(f"🔍 **Secret Santa lookup #{result['lookup_number']}:** {interaction.user.display_name} looked up "
+                            f"{member.display_name}'s match in **{event['name']}**.")
+    await interaction.response.send_message(
+        f"🔍 **{member.display_name}**\nTheir Santa: **{result['santa'] or 'nobody'}**\nThey're giving to: **{result['giftee'] or 'nobody'}**\n"
+        + ("*This lookup was logged in the mod channel.*" if logged else "*I couldn't post this lookup to the mod channel, but it was recorded.*"),
+        ephemeral=True)
 
-    last_post_map = {}
-    for channel in valid_channels:
-        try:
-            async for msg in channel.history(limit=None, after=cutoff, oldest_first=False):
-                if msg.author.bot:
-                    continue
-                existing = last_post_map.get(msg.author.id)
-                if existing is None or msg.created_at > existing[0]:
-                    last_post_map[msg.author.id] = (msg.created_at, channel.name)
-        except Exception as e:
-            print(f"⚠️ Backfill: could not scan #{channel.name}: {e}")
-            continue
 
-    conn = get_db()
-    backfilled = 0
-    for user_id, (last_time, channel_name) in last_post_map.items():
-        # member_last_seen — used by the purge-check system
-        existing_seen = conn.execute("SELECT 1 FROM member_last_seen WHERE user_id = ?", (user_id,)).fetchone()
-        if not existing_seen:
-            conn.execute(
-                "INSERT INTO member_last_seen (user_id, last_seen_at) VALUES (?, ?)",
-                (user_id, last_time.isoformat())
-            )
-            backfilled += 1
+@santa_group.command(name="dropout", description="[Mod] Remove someone, and repair the matches if they've been drawn")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+@app_commands.describe(member="The member leaving the exchange")
+async def santa_dropout(interaction: discord.Interaction, member: discord.Member, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=False)
+    if not event:
+        return
+    if not get_entry(event["id"], member.id):
+        await interaction.response.send_message("⚠️ That member isn't in this exchange.", ephemeral=True)
+        return
 
-        # message_log — this is what the WEBSITE's "Last Seen" column and
-        # tier calculation actually read from. Without this, the purge
-        # system gets fixed but the website display never reflects it.
-        existing_log = conn.execute("SELECT 1 FROM message_log WHERE user_id = ? LIMIT 1", (user_id,)).fetchone()
-        if not existing_log:
-            conn.execute(
-                "INSERT INTO message_log (user_id, channel_name, posted_at) VALUES (?, ?, ?)",
-                (user_id, channel_name, last_time.isoformat())
-            )
-    conn.commit()
-    conn.close()
-
-    # Push the freshly-backfilled data to the website right away, rather
-    # than making you wait up to an hour for the next scheduled sync.
-    try:
-        await sync_activity_once()
-    except Exception as e:
-        print(f"⚠️ Could not trigger immediate sync after backfill: {e}")
-
-    completion_msg = (
-        f"✅ Backfill complete. Found and filled in real history for **{backfilled}** member(s) "
-        f"who had no tracked activity yet — this now correctly feeds both the purge-check system "
-        f"AND the website's Member Activity display, so both should be accurate now. Anyone "
-        f"genuinely not found anywhere in the last {PURGE_THRESHOLD_DAYS} days is now correctly "
-        f"eligible for a purge review going forward — nobody gets auto-flagged from this command "
-        f"itself, that still only happens through the normal daily check."
-    )
-
-    # Discord's interaction reply window only lasts 15 minutes — a scan
-    # this long can easily outlast that, so post to a real channel instead
-    # of relying on the (possibly expired) interaction followup.
-    try:
-        await interaction.followup.send(completion_msg, ephemeral=True)
-    except Exception:
-        alert_channel = discord.utils.get(interaction.guild.text_channels, name=STRIKE_ALERT_CHANNEL)
-        if alert_channel:
-            await alert_channel.send(f"{interaction.user.mention} {completion_msg}")
+    async def do_drop():
+        result = drop_participant(event["id"], member.id)
+        if isinstance(result, tuple):
+            return f"⚠️ {result[1]}"
+        if result["phase"] == "signups":
+            return f"👋 Removed {member.display_name}."
+        parts = [f"👋 Removed {member.display_name}."]
+        if result["repaired"]:
+            parts.append("✅ The matches were repaired" + (" (one other pair was swapped to make it work)" if result.get("swapped") else "") + ".")
+            for uid in result["notify"]:
+                await _dm(uid, f"🎅 A quick update from **{event['name']}**: your giftee has changed because someone had to leave. "
+                               f"Press the 🎅 button on the announcement to see who you're giving to now.")
+            if result["notify"]:
+                parts.append(f"{len(result['notify'])} {'person was' if len(result['notify']) == 1 else 'people were'} told privately.")
+            if result.get("had_sent"):
+                parts.append("⚠️ Their Santa had already marked a gift as sent to the person who left, so you may want to check with them.")
         else:
-            print(f"⚠️ Backfill finished but couldn't notify anyone — interaction expired and no alert channel found. {completion_msg}")
+            parts.append(f"⚠️ I couldn't repair the matches automatically ({result['reason']}). Someone is now without a match, so you may want to handle it by hand.")
+        await _mod_log(f"👋 {interaction.user.display_name} removed {member.display_name} from **{event['name']}**."
+                       + (" Matches were repaired." if result["repaired"] else " Matches could NOT be repaired automatically."))
+        await refresh_announcement(event["id"])
+        await push_web(event["id"])
+        return " ".join(parts)
+
+    await interaction.response.send_message(
+        f"Remove **{member.display_name}** from **{event['name']}**?" + (" Their Santa and their giftee will be re-matched." if event["status"] == "drawn" else ""),
+        view=_ConfirmView(interaction.user.id, do_drop), ephemeral=True)
 
 
-@bot.tree.command(name="clearpurgeflag", description="[Mod] Dismiss an inactivity purge flag for a member")
-@app_commands.describe(member="Who to clear the flag for")
-async def clearpurgeflag(interaction: discord.Interaction, member: discord.Member):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
+def _batch_embeds(embeds, max_per_message=10, max_chars=5500):
+    """Groups embeds into messages. Discord allows at most 10 embeds and about 6000 characters of embed text
+    in one message, so a long reveal is split across several."""
+    batches, current, size = [], [], 0
+    for e in embeds:
+        n = len(e)
+        if current and (len(current) >= max_per_message or size + n > max_chars):
+            batches.append(current)
+            current, size = [], 0
+        current.append(e)
+        size += n
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _reveal_embeds(event, pairs):
+    embeds, lines = [], []
+    for p in pairs:
+        line = f"🎅 **{p['giver_name']}** ({p['giver_np']}) → 🎁 **{p['giftee_name']}** ({p['giftee_np']})"
+        if p.get("note"):
+            line += f"\n> 💌 “{p['note']}”"
+        lines.append(line)
+
+    def flush(chunk):
+        embeds.append(discord.Embed(title=f"🎊 Reveal: {event['name']}" if not embeds else None, description="\n".join(chunk), color=EMBED_COLOR))
+    chunk, size = [], 0
+    for line in lines:
+        if chunk and size + len(line) > 3500:
+            flush(chunk)
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        flush(chunk)
+    return embeds
+
+
+@santa_group.command(name="reveal", description="[Mod] Reveal who had whom, with any thank-you notes")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_reveal(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, statuses=("drawn",), none_text="⚠️ There's no drawn exchange to reveal.")
+    if not event:
+        return
+    c = counts(event["id"])
+
+    async def do_reveal():
+        ok, why = reveal_event(event["id"], _now())
+        if not ok:
+            return f"⚠️ {why}"
+        channel = await _get_channel(event["announce_channel_id"])
+        pairs = reveal_pairs(event["id"])
+        if channel is not None:
+            try:
+                for batch in _batch_embeds(_reveal_embeds(event, pairs)):
+                    await channel.send(embeds=batch, allowed_mentions=discord.AllowedMentions.none())
+            except Exception as e:
+                print(f"⚠️ Santa: couldn't post the reveal ({type(e).__name__})")
+        await refresh_announcement(event["id"])
+        await push_web(event["id"])
+        return "🎊 The reveal is posted! When you're done, run `/santa close` to end the exchange and erase everyone's wishlists."
+
+    await interaction.response.send_message(
+        f"Reveal **everyone's** matches for **{event['name']}** publicly? {c['sent']} of {c['matched']} gifts are marked sent. This can't be undone.",
+        view=_ConfirmView(interaction.user.id, do_reveal), ephemeral=True)
+
+
+@santa_group.command(name="close", description="[Mod] End the exchange and erase everyone's wishlists and notes")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_close(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, mine=False)
+    if not event:
         return
 
-    if interaction.channel.name != STRIKE_ALERT_CHANNEL:
-        await interaction.response.send_message(f"⚠️ This command can only be used in #{STRIKE_ALERT_CHANNEL}.", ephemeral=True)
+    async def do_close():
+        ok, why = close_event(event["id"], _now())
+        if not ok:
+            return f"⚠️ {why}"
+        await refresh_announcement(event["id"])
+        await push_web(event["id"])
+        return "🔒 The exchange is closed and everyone's wishlists, links and notes have been erased."
+
+    await interaction.response.send_message(
+        f"Close **{event['name']}**? This erases everyone's wishlists, links and notes. The pairs from the reveal stay on record.",
+        view=_ConfirmView(interaction.user.id, do_close), ephemeral=True)
+
+
+@santa_group.command(name="cancel", description="[Mod] Cancel an exchange that hasn't been drawn yet")
+@app_commands.describe(exchange=EXCHANGE_HELP)
+async def santa_cancel(interaction: discord.Interaction, exchange: Optional[str] = None):
+    if await _deny_wrong_guild(interaction) or await _deny_non_mod(interaction):
+        return
+    event = await _pick_event(interaction, exchange, statuses=("signups", "scheduled"), include_scheduled=True,
+                              none_text="⚠️ Only an exchange that hasn't been drawn can be cancelled.")
+    if not event:
         return
 
-    conn = get_db()
-    cursor = conn.execute("DELETE FROM purge_flags WHERE user_id = ?", (member.id,))
-    conn.commit()
-    conn.close()
+    async def do_cancel():
+        ok, why = cancel_event(event["id"], _now())
+        if not ok:
+            return f"⚠️ {why}"
+        if event["status"] == "scheduled":
+            return "🚫 Cancelled. It hadn't opened yet, so nothing was posted."
+        await refresh_announcement(event["id"])
+        await push_web(event["id"])
+        return "🚫 Cancelled. Everyone's entries were erased."
 
-    if cursor.rowcount > 0:
-        await interaction.response.send_message(f"✅ Purge flag cleared for {member.display_name}.", ephemeral=False)
-    else:
-        await interaction.response.send_message(f"{member.display_name} wasn't flagged.", ephemeral=False)
+    await interaction.response.send_message(f"Cancel **{event['name']}**? Everyone's entries will be erased.",
+                                            view=_ConfirmView(interaction.user.id, do_cancel), ephemeral=True)
+
+
+for _cmd in (santa_open, santa_reschedule, santa_join, santa_leave, santa_me, santa_match, santa_sent, santa_received, santa_block, santa_unblock,
+             santa_draw, santa_status, santa_remind, santa_lookup, santa_dropout, santa_reveal, santa_close, santa_cancel):
+    _cmd.autocomplete("exchange")(_exchange_autocomplete)
 
 
 # ============================================================
-#  WEEKLY BC-ENTRIES CLEARING — every Friday 11:30 AM Pacific,
-#  automatically. Uses zoneinfo so it stays correct across
-#  Daylight Saving time changes without needing manual adjustment.
+#  SETUP - called from main.py
 # ============================================================
 
-async def clear_bc_entries_once():
-    for guild in bot.guilds:
-        channel = discord.utils.get(guild.text_channels, name=BC_ENTRIES_CHANNEL)
-        if not channel:
-            print(f"⚠️ Channel '{BC_ENTRIES_CHANNEL}' not found in {guild.name} — skipping weekly clear")
-            continue
-        try:
-            deleted = await channel.purge(limit=None)
-            print(f"🧹 Cleared {len(deleted)} messages from #{BC_ENTRIES_CHANNEL} in {guild.name}")
-        except discord.Forbidden:
-            print(f"⚠️ Missing permission to clear #{BC_ENTRIES_CHANNEL} in {guild.name} — bot needs Manage Messages there")
-        except Exception as e:
-            print(f"⚠️ Could not clear #{BC_ENTRIES_CHANNEL} in {guild.name}: {e}")
-
-
-async def bc_entries_clear_loop():
-    await bot.wait_until_ready()
-    last_cleared_date = None
-
-    while not bot.is_closed():
-        now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
-        is_target_window = (
-            now_pacific.weekday() == BC_CLEAR_WEEKDAY
-            and now_pacific.hour == BC_CLEAR_HOUR
-            and BC_CLEAR_MINUTE <= now_pacific.minute < BC_CLEAR_MINUTE + BC_CLEAR_CHECK_INTERVAL_MINUTES
-        )
-
-        if is_target_window and last_cleared_date != now_pacific.date():
-            print(f"🧹 Running scheduled weekly clear of #{BC_ENTRIES_CHANNEL}...")
-            await clear_bc_entries_once()
-            last_cleared_date = now_pacific.date()
-
-        await asyncio.sleep(BC_CLEAR_CHECK_INTERVAL_MINUTES * 60)
-
-
-# ============================================================
-#  BIRTHDAYS — members set their birthday once, and every day the
-#  bot checks (at midnight Pacific) who's having one, grants them
-#  the birthday role for the day, announces it, and removes the
-#  role from anyone whose birthday has now passed.
-# ============================================================
-
-def is_valid_birthday_date(month: int, day: int) -> bool:
-    if month < 1 or month > 12:
-        return False
-    days_in_month = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]  # Feb allows 29 (leap years handled separately)
-    return 1 <= day <= days_in_month[month - 1]
-
-
-async def run_birthday_check():
-    now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
-    today_month = now_pacific.month
-    today_day = now_pacific.day
-
-    # Feb 29 birthdays celebrate on Feb 28 in non-leap years
-    is_leap = calendar.isleap(now_pacific.year)
-
-    conn = get_db()
-    rows = conn.execute("SELECT user_id, birth_month, birth_day, birth_year FROM birthdays").fetchall()
-    conn.close()
-
-    todays_birthday_user_ids = set()
-    for row in rows:
-        bmonth, bday = row["birth_month"], row["birth_day"]
-        if bmonth == 2 and bday == 29 and not is_leap:
-            bday = 28  # fallback for non-leap years
-        if bmonth == today_month and bday == today_day:
-            todays_birthday_user_ids.add((row["user_id"], row["birth_year"]))
-
-    for guild in bot.guilds:
-        if guild.name != MAIN_GUILD_NAME:
-            continue
-
-        role = discord.utils.get(guild.roles, name=BIRTHDAY_ROLE_NAME)
-        if not role:
-            print(f"⚠️ Birthday role '{BIRTHDAY_ROLE_NAME}' not found in {guild.name}")
-            continue
-
-        channel = discord.utils.get(guild.text_channels, name=BIRTHDAY_CHANNEL)
-        todays_ids = {uid for uid, _year in todays_birthday_user_ids}
-
-        # Remove the role from anyone who has it but isn't celebrating today
-        for member in list(role.members):
-            if member.id not in todays_ids:
-                try:
-                    await member.remove_roles(role)
-                    print(f"🎂 Removed birthday role from {member.display_name} (birthday over)")
-                except Exception as e:
-                    print(f"⚠️ Could not remove birthday role from {member.display_name}: {e}")
-
-        # Grant the role + announce for anyone celebrating today who doesn't have it yet
-        for user_id, birth_year in todays_birthday_user_ids:
-            member = guild.get_member(user_id)
-            if not member:
-                continue
-            if role not in member.roles:
-                try:
-                    await member.add_roles(role)
-                    print(f"🎂 Gave birthday role to {member.display_name}")
-                except Exception as e:
-                    print(f"⚠️ Could not give birthday role to {member.display_name}: {e}")
-                    continue
-
-                if channel:
-                    age_note = ""
-                    if birth_year:
-                        age = now_pacific.year - birth_year
-                        age_note = f" (turning {age}!)"
-                    await channel.send(f"🎉 It's {member.mention}'s birthday!{age_note} 🎂")
-
-
-async def birthday_check_loop():
-    await bot.wait_until_ready()
-    last_checked_date = None
-
-    while not bot.is_closed():
-        now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
-        is_target_window = (
-            now_pacific.hour == BIRTHDAY_CHECK_HOUR
-            and BIRTHDAY_CHECK_MINUTE <= now_pacific.minute < BIRTHDAY_CHECK_MINUTE + BIRTHDAY_CHECK_INTERVAL_MINUTES
-        )
-
-        if is_target_window and last_checked_date != now_pacific.date():
-            print("🎂 Running daily birthday check...")
-            await run_birthday_check()
-            last_checked_date = now_pacific.date()
-
-        await asyncio.sleep(BIRTHDAY_CHECK_INTERVAL_MINUTES * 60)
-
-
-async def refresh_birthday_list_message():
-    """Rebuilds the persistent birthday list embed and edits it in place —
-    called right after anyone sets or removes their birthday, so the list
-    updates instantly without anyone needing to run a command to see it."""
-    guild = discord.utils.get(bot.guilds, name=MAIN_GUILD_NAME)
-    if not guild:
-        return
-
-    conn = get_db()
-    rows = conn.execute("SELECT user_id, birth_month, birth_day FROM birthdays").fetchall()
-
-    stored = conn.execute("SELECT channel_id, message_id FROM birthday_list_message WHERE id = 1").fetchone()
-    conn.close()
-
-    month_names = ["January", "February", "March", "April", "May", "June",
-                   "July", "August", "September", "October", "November", "December"]
-
-    by_month = {m: [] for m in range(1, 13)}
-    for row in rows:
-        by_month[row["birth_month"]].append((row["birth_day"], row["user_id"]))
-
-    embed = discord.Embed(title="🎂 Guild Birthday List", color=0xD68A4E)
-    has_any = False
-    for m in range(1, 13):
-        entries = sorted(by_month[m])
-        if not entries:
-            continue
-        has_any = True
-        field_lines = [f"{day} — <@{user_id}>" for day, user_id in entries]
-        field_value = "\n".join(field_lines)
-        if len(field_value) > 1024:  # Discord's per-field limit
-            field_value = field_value[:1000] + "\n…(too many to show, see /birthdaylist)"
-        embed.add_field(name=month_names[m - 1], value=field_value, inline=True)
-
-    if not has_any:
-        embed.description = "No birthdays saved yet — add yours with /setbirthday!"
-
-    channel = discord.utils.get(guild.text_channels, name=BIRTHDAY_CHANNEL)
-    if not channel:
-        print(f"⚠️ Birthday channel '{BIRTHDAY_CHANNEL}' not found — can't update the list message")
-        return
-
-    conn = get_db()
-
-    # Try editing the existing message first
-    if stored:
-        try:
-            existing_channel = bot.get_channel(stored["channel_id"]) or await bot.fetch_channel(stored["channel_id"])
-            message = await existing_channel.fetch_message(stored["message_id"])
-            await message.edit(embed=embed)
-            conn.close()
-            return
-        except (discord.NotFound, discord.Forbidden, Exception) as e:
-            print(f"ℹ️ Couldn't edit existing birthday list message ({e}) — posting a fresh one instead")
-
-    # No existing message (or it's gone) — post a new one and remember it
-    new_message = await channel.send(embed=embed)
-    try:
-        await new_message.pin()
-    except Exception as e:
-        print(f"⚠️ Could not pin the birthday list message: {e}")
-
-    conn.execute("""
-        INSERT INTO birthday_list_message (id, channel_id, message_id) VALUES (1, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET channel_id = excluded.channel_id, message_id = excluded.message_id
-    """, (channel.id, new_message.id))
-    conn.commit()
-    conn.close()
-
-
-@bot.tree.command(name="setbirthday", description="Set your birthday (year is optional)")
-@app_commands.describe(
-    month="Month (1-12)",
-    day="Day of the month",
-    year="Optional — only include if you're comfortable sharing it",
-)
-async def setbirthday(interaction: discord.Interaction, month: int, day: int, year: int = None):
-    if not is_valid_birthday_date(month, day):
-        await interaction.response.send_message("⚠️ That's not a valid date — check the month/day and try again.", ephemeral=True)
-        return
-
-    if year is not None and (year < 1900 or year > datetime.now().year):
-        await interaction.response.send_message("⚠️ That year doesn't look right.", ephemeral=True)
-        return
-
-    conn = get_db()
-    conn.execute("""
-        INSERT INTO birthdays (user_id, birth_month, birth_day, birth_year, set_at)
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            birth_month = excluded.birth_month,
-            birth_day = excluded.birth_day,
-            birth_year = excluded.birth_year,
-            set_at = excluded.set_at
-    """, (interaction.user.id, month, day, year, datetime.now(timezone.utc).isoformat()))
-    conn.commit()
-    conn.close()
-
-    date_str = f"{month}/{day}" + (f"/{year}" if year else "")
-    await interaction.response.send_message(f"✅ Birthday set to {date_str}!", ephemeral=True)
-    await refresh_birthday_list_message()
-
-
-@bot.tree.command(name="removebirthday", description="Remove your saved birthday")
-async def removebirthday(interaction: discord.Interaction):
-    conn = get_db()
-    cursor = conn.execute("DELETE FROM birthdays WHERE user_id = ?", (interaction.user.id,))
-    conn.commit()
-    conn.close()
-
-    if cursor.rowcount > 0:
-        await interaction.response.send_message("✅ Your birthday has been removed.", ephemeral=True)
-        await refresh_birthday_list_message()
-    else:
-        await interaction.response.send_message("You don't have a birthday saved.", ephemeral=True)
-
-
-@bot.tree.command(name="birthdays", description="See the list of upcoming birthdays")
-async def birthdays(interaction: discord.Interaction):
-    conn = get_db()
-    rows = conn.execute("SELECT user_id, birth_month, birth_day FROM birthdays").fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message("No birthdays have been added yet.", ephemeral=True)
-        return
-
-    now_pacific = datetime.now(ZoneInfo("America/Los_Angeles"))
-    today = (now_pacific.month, now_pacific.day)
-
-    def days_until(month, day):
-        # How many days from today until this month/day next occurs (0 if today)
-        this_year_date = (month, day)
-        if this_year_date >= today:
-            target = now_pacific.replace(month=month, day=min(day, 28) if month == 2 else day, year=now_pacific.year)
-        else:
-            target = now_pacific.replace(month=month, day=min(day, 28) if month == 2 else day, year=now_pacific.year + 1)
-        return (target.date() - now_pacific.date()).days
-
-    entries = []
-    for row in rows:
-        member = interaction.guild.get_member(row["user_id"]) if interaction.guild else None
-        name = member.display_name if member else f"User {row['user_id']}"
-        days_away = days_until(row["birth_month"], row["birth_day"])
-        entries.append((days_away, row["birth_month"], row["birth_day"], name))
-
-    entries.sort(key=lambda e: e[0])
-
-    lines = ["**Upcoming Birthdays:**"]
-    for days_away, month, day, name in entries[:25]:
-        when = "Today! 🎉" if days_away == 0 else ("Tomorrow" if days_away == 1 else f"in {days_away} days")
-        lines.append(f"{month}/{day} — {name} ({when})")
-
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
-
-
-@bot.tree.command(name="birthdaylist", description="See every saved birthday, in calendar order (Jan-Dec)")
-async def birthdaylist(interaction: discord.Interaction):
-    conn = get_db()
-    rows = conn.execute("SELECT user_id, birth_month, birth_day FROM birthdays").fetchall()
-    conn.close()
-
-    if not rows:
-        await interaction.response.send_message("No birthdays have been added yet.", ephemeral=True)
-        return
-
-    month_names = ["January", "February", "March", "April", "May", "June",
-                   "July", "August", "September", "October", "November", "December"]
-
-    by_month = {m: [] for m in range(1, 13)}
-    for row in rows:
-        member = interaction.guild.get_member(row["user_id"]) if interaction.guild else None
-        name = member.display_name if member else f"User {row['user_id']}"
-        by_month[row["birth_month"]].append((row["birth_day"], name))
-
-    # Build the full text first, grouped by month, sorted by day within each month
-    sections = []
-    for m in range(1, 13):
-        entries = sorted(by_month[m])
-        if not entries:
-            continue
-        section_lines = [f"**{month_names[m - 1]}**"]
-        for day, name in entries:
-            section_lines.append(f"{month_names[m - 1][:3]} {day} — {name}")
-        sections.append("\n".join(section_lines))
-
-    # Split into chunks that fit Discord's message length limit, breaking
-    # between months rather than mid-list — a 70+ member guild can easily
-    # produce more birthdays than fit in one message.
-    chunks = []
-    current = "🎂 **Guild Birthday List**\n\n"
-    for section in sections:
-        if len(current) + len(section) + 2 > 1900:
-            chunks.append(current)
-            current = ""
-        current += section + "\n\n"
-    if current.strip():
-        chunks.append(current)
-
-    await interaction.response.send_message(chunks[0], ephemeral=False)
-    for chunk in chunks[1:]:
-        await interaction.followup.send(chunk, ephemeral=False)
-
-
-@bot.tree.command(name="suggest", description="Submit a suggestion for the guild")
-async def suggest(interaction: discord.Interaction):
-    await interaction.response.send_modal(SuggestionModal())
-
-
-@bot.tree.command(name="clearbcentries", description="[Mod] Manually clear #bc-entries right now (normally runs automatically every Friday)")
-async def clearbcentries(interaction: discord.Interaction):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-    await clear_bc_entries_once()
-    await interaction.followup.send(f"✅ Cleared #{BC_ENTRIES_CHANNEL}.", ephemeral=True)
-
-
-@bot.tree.command(name="foodclubreset", description="[Mod] Clear today's Food Club check and re-run it immediately")
-async def foodclubreset(interaction: discord.Interaction):
-    if not any(r.name in BOT_MOD_ROLES for r in interaction.user.roles):
-        await interaction.response.send_message("⚠️ You don't have permission to use this.", ephemeral=True)
-        return
-
-    await interaction.response.defer(ephemeral=True)
-
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    db_delete_food_club_status(today_str)
-    print(f"🥕 {interaction.user.display_name} manually reset Food Club status for {today_str}")
-
-    result = await run_food_club_check()
-    await interaction.followup.send(f"✅ Re-ran the check.\n**Result:** {result}", ephemeral=True)
-
-
-# ============================================================
-#  RUN
-# ============================================================
-
-init_db()
-points.setup(
-    bot, get_db,
-    mod_roles=BOT_MOD_ROLES,
-    main_guild_name=MAIN_GUILD_NAME,
-    excluded_channels=IGNORED_CHANNELS + [GIVEAWAY_CHANNEL, BC_ENTRIES_CHANNEL, STRIKE_ALERT_CHANNEL],
-    request_channel_name=STRIKE_ALERT_CHANNEL,
-)
-contest.setup(bot, get_db, BOT_MOD_ROLES, MAIN_GUILD_NAME)
-santa.setup(bot, get_db, BOT_MOD_ROLES, MAIN_GUILD_NAME, STRIKE_ALERT_CHANNEL)
-bot.run(BOT_TOKEN)
-
+def setup(bot, get_db, mod_roles, main_guild_name, mod_channel_name=None):
+    global _bot, _get_db_fn, _mod_roles, _guild_names, _mod_channel_name
+    _bot = bot
+    _get_db_fn = get_db
+    _mod_roles = list(mod_roles)
+    _guild_names = [main_guild_name] + list(SANTA_GUILD_NAMES_EXTRA)
+    _mod_channel_name = mod_channel_name
+    init_tables()
+    bot.tree.add_command(santa_group)
+    print("🎅 Secret Santa ready")
+
+
+def start_background(bot):
+    """Call from on_ready: re-attaches the buttons on announcements made before a restart, and starts the loop
+    that sends reminders and keeps the website current."""
+    bot.add_view(SantaView())
+    bot.loop.create_task(santa_loop())
